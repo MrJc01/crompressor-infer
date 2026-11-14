@@ -564,3 +564,106 @@ JSON: `experiments/codebook-lut/qualidade_v2.json`; log integral:
 `experiments/codebook-lut/qualidade_v2_run.log`.
 
 ---
+## EXP-007 — Formato .cromllm v1: spec, empacotador e gabarito PyTorch
+
+**Data**: 2026-11-14 | **Status**: concluído
+**Objetivo**: definir o formato binário de inferência (`.cromllm`) do
+motor C+Go — alinhado a 4 KiB para `O_DIRECT`/`pread` — empacotar o
+granite-3.1-1b-a400m-instruct nele e gerar o gabarito numérico
+(`golden_ref`) do PyTorch BF16 para validar o motor depois.
+
+### Raio-X da matemática do GraniteMoe (referência para o motor)
+
+| Componente | Valor exato (do código `modeling_granitemoe.py`) |
+|---|---|
+| Config | vocab 49155, hidden 1024, inter 512, 24 camadas, 16 heads, 8 KV heads, head_dim 64, 32 experts, top-8 |
+| Embedding | `inputs_embeds *= 12.0` (embedding_multiplier, linha 674) |
+| RoPE | **split-half** (`rotate_half`: `cat(-x2, x1)`), rope_theta = 1 500 000 |
+| Router | **`topk(8)` nos logits crus ANTES do softmax**; softmax só nos 8 selecionados (renormaliza p/ somar 1) |
+| Expert MLP | `input_linear` [32,1024,1024] `chunk(2)`: 1ª metade = gate (silu), 2ª = up; `output_linear` [32,1024,512] |
+| Pesos | `[out, in]` — F.linear = `x @ W.T` |
+| Attn | k/v [512,1024], q/o [1024,1024]; attention_multiplier 0.015625 |
+| Residual | residual_multiplier 0.22 |
+| Saída | `logits /= 6.0` (logits_scaling, linha 957); `lm_head` = embed (tied) |
+| Norm | RMSNorm eps 1e-06 |
+
+### Formato .cromllm v1 (docs/03-formato-cromllm.md)
+
+- Header 4 096 B (fmt `<8s14IffffffQQIIQQQQ` = 144 B + pad; magic
+  `CROMLM01`), tokenizer.json embutido, bloco Hot residente em RAM,
+  diretório de experts e experts contíguos em disco.
+- Hot (146 489 344 B): embed F16 (100 669 440), 49 norms FP32 (200 704),
+  24 routers FP32 (3 145 728), inv_freq FP32 (128) e 24 camadas de
+  atenção Q4_G64 (q,k,v,o = 589 824 + 294 912×2 + 589 824 B = 1 769 472
+  B/camada; total 42 467 328).
+- Expert: input [1024,1024] + output [1024,512] em Q4_G64 (idx u8 +
+  escalas FP32, grupos de 64 nas cols; layout byte `c` = `(q[c]+8) |
+  ((q[c+32]+8)<<4)`, idêntico ao `kv_q4` do EXP-005) = 884 736 B
+  exatos = 216 páginas 4K → **1 expert = 1 `pread()` único**.
+- 768 entradas de diretório de 24 B (offset u64, size u64, format_id
+  u32, reserved u32) — format_id por entrada permite híbridos futuros
+  (C1_v2/C3 do EXP-006 como format_id extras).
+- Arquivo final: **829 468 672 B (791,0 MiB)** — experts 679 477 248 B
+  (648,0 MiB) + hot 146,5 MB + tokenizer 3,5 MB.
+
+### Round-trip de validação (dequant vs peso BF16 original)
+
+| Matriz | Erro L2 rel |
+|---|---|
+| o_proj L0 | 0,1140 |
+| expert L0/E0 input | 0,1187 |
+| expert L0/E0 output | 0,1105 |
+
+Coerente com o erro global Q4_G64 do EXP-004 (0,1123). Aviso: o
+comparador do EXP-006 v_q4 usa `s` em FP16 e o do EXP-004 em FP32; o
+formato usa escalas FP32 (EXP-005).
+
+### Gabarito PyTorch (golden_ref)
+
+- Frase: `"Explain a hash table in one sentence:"`
+- input_ids (8): [37394, 312, 3677, 1858, 328, 1591, 15430, 44]
+- Roteamento (último token, top-8 + softmax): L0 experts
+  [7,9,6,13,17,1,0,25] pesos [0.370193, 0.154319, 0.140509, 0.102799,
+  0.08006, 0.075209, 0.040257, 0.036654]; L23 experts
+  [27,16,18,12,31,0,10,24] pesos [0.204587, 0.150853, 0.149679,
+  0.127031, 0.112984, 0.10368, 0.085284, 0.065903]
+- Top-10 logits (já ÷6.0): [203]=29.375 '\n', [399]=27.375 ' A',
+  [5033]=25.375 ' Hash', [2030]=23.375 ' It', [225]=23.125 ' ',
+  [1659]=23.0 ' \n', [886]=22.375 ' The', [313]=22.375 ' "',
+  [0]=22.125 '<|end_of_text|>', [312]=21.625 ' a'
+- Próximo token greedy: **id=203 '\n'**
+- JSON completo: `artifacts/golden_ref.json` (fora do git); resumo
+  commitado em `experiments/logs/baseline-hf/golden_ref_meta.json`.
+
+### Bugs pegos no caminho (lições)
+
+1. **Header não escrito no início**: o `pack()` só gravava o header no
+   FIM, então o tokenizer começava no offset 0 (4 KiB atrás) e o header
+   final sobrescrevia os primeiros 4 KiB do JSON — toda a contagem de
+   offsets do bloco Hot deslocada, escalas da atenção lidas errado
+   (NaN). Fix: gravar header placeholder no início + patchear offsets
+   reais no fim.
+2. **`struct.pack` com contagem errada**: fmt do header tinha 1 `f` a
+   menos (6 floats: rope_theta + eps + 4 multiplicadores) e 1 `Q` a
+   menos no fim (experts_off, tok_off, tok_size); diretório de 24 B
+   exigia `(off, size, format_id, reserved)` — faltava o reserved.
+   Trava `assert struct.calcsize(HEAD_FMT) == 144` adicionada.
+3. **Dequant intercalado**: `stack([lo,hi],dim=2)` intercala nibbles;
+   correto é `cat([lo,hi],dim=2)` após `view(rows, ng, 32)`.
+4. Debug por needle-search com mmap (procurar bytes conhecidos no
+   arquivo e achar o deslocamento real) foi decisivo — impressão de
+   offsets do pack não bastava porque o erro era entre contabilidade e
+   posição real do arquivo.
+
+### Como rodar
+
+```
+python3 tools/pack_cromllm.py            # empacota + round-trip (~3 min)
+python3 tools/pack_cromllm.py --golden   # gabarito PyTorch BF16
+```
+
+JSON: `artifacts/golden_ref.json`; meta: `experiments/logs/
+baseline-hf/golden_ref_meta.json`. `.cromllm` fica fora do git
+(`artifacts/` no .gitignore).
+
+---
