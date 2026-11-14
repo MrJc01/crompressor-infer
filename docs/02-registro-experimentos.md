@@ -447,7 +447,8 @@ final (disco livre: 45 GB).
 | 16 | 68,69% | 60,1 MB | 5,7 |
 | 24 | 89,06% | 21,0 MB | 16,4 |
 
-Conclusão T1: com cap 24/32 (RAM ~7,4 GB no formato Q4 de 1,3B) a
+Conclusão T1: com cap 24/32 (RAM ~459 MB no formato Q4 de 1,3B — ou ~7,4 GB em
+um MoE ~16x maior de ~20B) a
 leitura de SSD cai a ~21 MB/token; com cap 8 ainda são 125 MB/token.
 O cache de experts só "fecha" perto do working set inteiro — a
 recorrência por prompt é alta (89% dos acertos em 24), mas entre
@@ -491,5 +492,75 @@ no teto de RAM ~30 GB/s; B1 fica em 8,9 GB/s, limitado pelo gather)
 
 JSON/log: `experiments/delta-sparse/moe_cache_trace.json` (T1);
 log integral do T2: `experiments/codebook-lut/bench_kernels_run.log`.
+
+---
+## [EXP-006] — Qualidade (PPL) abaixo de 4 bits/peso: Q3, LUT16 K=16, C3 (delta 1-bit), C1_v2 e Híbrido
+
+**Data:** 2026-11-14 · **Caminho:** B (codebook/LUT) + C (híbrido) · **Status:** concluído
+
+### Pergunta
+
+Dá para derrubar a PPL de variantes < 4 bits/peso sem bitmap e sem saltos
+na CPU, de forma que sobrevivam ao kernel VPSHUFB/gather do EXP-005?
+Testamos 6 variantes no VAL_TEXT (mesmo do EXP-003/004), com backtesting
+idêntico ao EXP-004 (restaura → quantiza tensor a tensor → erro L2 + PPL).
+
+### Código/Script
+
+- Script: `experiments/codebook-lut/test_qualidade_v2.py`
+  (torch 2.12, threads=6, local_files_only, bf16, backup dos experts em
+  disco `experts_backup.pt` removido ao final; K-Means K=16/K=256 com
+  TRAIN_N=30 000 e 8 iters; `torch.quantile` em amostra de 200 000 para
+  o limiar de 70% do C1_v2)
+- Como rodar: `python3 test_qualidade_v2.py` (~9 min; sem prompts)
+- Nota: bits/peso contados honestamente (códigos + escalas fp16 por
+  grupo + codebook fp16); C1_v2 ficou em 3,10 bits reais (a estimativa
+  ~3,80 do plano assumia contagem mais conservadora do ternário).
+
+### Métricas numéricas (experts: 1 207 959 552 params; BF16 ref PPL = 56,511)
+
+| Variante | bits/peso | MB experts | Compressão | Erro L2 | PPL | ΔPPL vs BF16 | Tempo |
+|---|---|---|---|---|---|---|---|
+| BF16 (referência) | 16,0 | 2 304,0 | 1,00x | 0 | 56,511 | — | — |
+| Q4_grupo64 (EXP-004) | 4,25 | 612,0 | 3,76x | 0,1123 | **63,43** | +6,92 | — |
+| Q3_grupo64 | 3,25 | 468,0 | 4,92x | 0,2614 | 113,35 | +56,84 | 21s |
+| LUT16_d1_K16 | 4,25 | 612,0 | 3,76x | 0,1153 | 65,62 | +9,11 | 78s |
+| LUT16_d2_K16 | 2,25 | 324,0 | 7,11x | 0,3407 | 504,91 | +448,40 | 46s |
+| C3_LUT16_d2_plus_1bit | 3,50 | 504,0 | 4,57x | 0,1998 | 112,44 | +55,93 | 52s |
+| **C1_v2_K256_DeltaGrupo** | **3,10** | 446,4 | 5,16x | 0,1746 | **86,66** | **+30,15** | 322s |
+| Hibrido_Misto (Q4 ext + C3 cent) | 3,75 | 540,0 | 4,27x | 0,1743 | 79,47 | +22,96 | 40s |
+
+RSS pico do processo: **5 724 MB**; backup removido ao final.
+
+### Conclusão
+
+1. **C1_v2 é o melhor ponto < 4 bits** (3,10 bits, PPL 86,66): o codebook
+   d=4 K=256 pega a estrutura, e o delta ternário com escala POR GRUPO de
+   64 preserva os outliers locais — sem ele (B2 puro, EXP-004) a PPL ia
+   a 474,75. A lição do EXP-004 ("escala por grupo importa mais que
+   erro L2 global") se confirma de novo: C3 (3,50 bits) tem erro maior
+   (0,1998 vs 0,1746) e PPL pior (112,44 vs 86,66) porque o delta 1-bit
+   denso uniformiza a correção.
+2. **Q3 puro (3,25) é ruim** (+56,84): régua simétrica de 3 níveis
+   destrói outliers tanto quanto o codebook puro — LUT16_d1 no MESMO
+   4,25 bits do Q4 também perde (65,62 vs 63,43): o codebook K=16
+   compartilhado por tensor uniformiza erros e perde para a escala
+   direta por grupo.
+3. **Posição da camada importa**: o Híbrido (Q4 nas 8 camadas extremas
+   + C3 nas 16 centrais) cai de 112,44 (C3 puro) para 79,47 com só
+   3,75 bits — as camadas extremas (primeiras/últimas) são mais
+   sensíveis à quantização, como esperado pela literatura de LLM.
+4. **Trade-off prático para o motor**: nenhum formato < 4 bits bate o
+   Q4_grupo64 4,25 bits (PPL 63,43, 171 tok/s no EXP-005). Se o alvo
+   for disco/SSD (Caminho A), C1_v2 (3,10 bits, 446 MB, 5,16x) é a
+   melhor variante compacta; a curva Q4→C1_v2 define o degrau de
+   qualidade por bits que o motor pode escolher por modelo.
+5. Próximo passo natural: reavaliar C1_v2 com delta ternário em
+   blocos menores (G=32) ou RVQ de 2 estágios no residual — sem mudar
+   o formato do kernel (códigos + escalas por grupo continuam vpxshufb-
+   friendly).
+
+JSON: `experiments/codebook-lut/qualidade_v2.json`; log integral:
+`experiments/codebook-lut/qualidade_v2_run.log`.
 
 ---
