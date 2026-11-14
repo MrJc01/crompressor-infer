@@ -129,18 +129,19 @@ RAM, que é o diferencial real frente a soluções `mmap`.
 
 ## 5. Higiene e Empacotamento
 
-- Aumentar `CROM_MAX_SEQ` (ex.: **2048** ou tamanho dinâmico no cabeçalho).
-- Adicionar flag **`--repeat-penalty`** na amostragem.
-- Suportar **múltiplos modelos** no cabeçalho `.cromllm` (catálogo/versão).
-- Manter `crompressor/`, `artifacts/`, `bin/`, `*.a`, `*.o` fora do versionamento.
+- [x] **Aumentar `CROM_MAX_SEQ`** e tornar contexto dinâmico no cabeçalho / flag `--ctx 2048` (**concluído no EXP-011**).
+- [x] **Adicionar flag `--repeat-penalty`** na amostragem (**concluído no EXP-011**).
+- [x] **Motor C e Go 100% dinâmico** por header `.cromllm` sem hardcoding de dimensões (**concluído no EXP-011**).
+- [ ] Suportar **múltiplos modelos** no cabeçalho `.cromllm` (catálogo/versão).
+- [x] Manter `crompressor/`, `artifacts/`, `bin/`, `*.a`, `*.o` fora do versionamento.
 
 ---
 
 ## 6. Ordem sugerida de retomada
 
-1. **B.1 Prefetch assíncrono** (ganho rápido no modo que mais sofre: SSD).
-2. **B.3 Batch Prefill (GEMM)** (elimina o maior gap vs Ollama).
-3. **B.2 `C1_v2`** (reduz bytes por token e viabiliza o Marco A).
-4. **A — modelo maior que a RAM** (usa B.1/B.2 como base).
-5. **C — deltas P2P / multi-fine-tune** (diferencial de produto).
-6. **Higiene** contínua (contexto maior, `--repeat-penalty`, multi-modelo).
+1. **EXP-011** (Motor Dinâmico + `--ctx 2048` + `--repeat-penalty`) — **CONCLUÍDO**.
+2. **B.1 Prefetch assíncrono** (ganho rápido no modo que mais sofre: SSD).
+3. **B.3 Batch Prefill (GEMM)** (elimina o maior gap vs Ollama).
+4. **B.2 `C1_v2`** (reduz bytes por token e viabiliza o Marco A).
+5. **A — modelo maior que a RAM** (usa B.1/B.2 como base).
+6. **C — deltas P2P / multi-fine-tune** (diferencial de produto).

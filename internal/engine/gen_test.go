@@ -1,10 +1,15 @@
 package engine
 
 import (
+	"runtime"
+	"runtime/debug"
 	"testing"
 )
 
 func TestGenerate(t *testing.T) {
+	runtime.LockOSThread()
+	debug.SetGCPercent(-1)
+
 	model, err := Open(Config{
 		ModelPath:    "../../artifacts/granite-1b.cromllm",
 		CacheExperts: 768,
@@ -15,8 +20,8 @@ func TestGenerate(t *testing.T) {
 	}
 	defer model.Close()
 
-	hidden := make([]float32, 1024)
-	logits := make([]float32, 49155)
+	hidden := make([]float32, model.HiddenSize())
+	logits := make([]float32, model.VocabSize())
 	inputIDs := []int{37394, 312, 3677, 1858, 328, 1591, 15430, 44}
 
 	// Prefill
@@ -32,7 +37,7 @@ func TestGenerate(t *testing.T) {
 		
 		nextID := 0
 		maxLogit := float32(-1e30)
-		for i := 0; i < 49155; i++ {
+		for i := 0; i < model.VocabSize(); i++ {
 			if logits[i] > maxLogit {
 				maxLogit = logits[i]
 				nextID = i

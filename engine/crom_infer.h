@@ -61,7 +61,7 @@ typedef struct {
 
 typedef struct {
     crom_attn_t  attn;
-    crom_expert_t experts[CROM_NUM_EXPERTS];
+    crom_expert_t *experts;  /* alocado dinamicamente: num_local_experts */
     float *router_weight;   /* aponta para routers_f32 */
 } crom_layer_t;
 
@@ -98,13 +98,24 @@ typedef struct {
     int streaming;
     int fd;
     int threads;
-    const char *path;  /* caminho do arquivo .cromllm */
+    int max_seq;             /* contexto dinâmico */
+    size_t expert_size;      /* tamanho em bytes de cada expert */
+    int total_experts;       /* num_layers * num_local_experts */
+    const char *path;        /* caminho do arquivo .cromllm */
 
     float *k_cache;
     float *v_cache;
 
     float *work1;
     float *moe_acc_buf;
+    float *attn_scores;      /* buffer de scores de tamanho max_seq */
+
+    /* buffers dinâmicos de roteamento MoE */
+    float *router_logits;
+    int   *router_idx;
+    int   *top_experts;
+    float *top_weights;
+    float *top_logits;
 
     long long cache_hits;
     long long cache_misses;
@@ -128,6 +139,7 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 int crom_model_open(const char *path, crom_model_t *m, int cache_experts, int threads);
+int crom_model_open_ctx(const char *path, crom_model_t *m, int cache_experts, int threads, int max_seq);
 void crom_model_close(crom_model_t *m);
 int crom_forward(crom_model_t *m, const int *input_ids, int n_ids,
                  int position, float *hidden, float *out_logits);
@@ -142,6 +154,12 @@ void crom_stats(const crom_model_t *m, long long *hits, long long *misses,
                 long long *bytes, long long *stream_bytes, double *io_ms,
                 double *attn_ms, double *moe_ms, double *lm_head_ms);
 void crom_reset_kv(crom_model_t *m);
+
+/* Getters para Go/C */
+int crom_vocab_size(const crom_model_t *m);
+int crom_hidden_size(const crom_model_t *m);
+int crom_num_experts_total(const crom_model_t *m);
+int crom_max_seq(const crom_model_t *m);
 
 /* tokenizer embutido */
 const void *crom_tokenizer_data(const crom_model_t *m, size_t *out_size);

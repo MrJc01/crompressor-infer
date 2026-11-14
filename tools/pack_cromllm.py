@@ -74,9 +74,9 @@ def section(f, pos, data):
     return pos
 
 
-def pack():
+def pack(model_id=MODEL_ID, out_path=OUT):
     torch.set_num_threads(6)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.bfloat16,
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16,
                                                  low_cpu_mem_usage=True,
                                                  local_files_only=True)
     model.eval()
@@ -84,7 +84,7 @@ def pack():
     L, E, H = cfg.num_hidden_layers, cfg.num_local_experts, cfg.hidden_size
     params = dict(model.named_parameters())
 
-    tok_path = os.path.dirname(cached_file(MODEL_ID, "config.json", local_files_only=True))
+    tok_path = os.path.dirname(cached_file(model_id, "config.json", local_files_only=True))
     tok_bytes = open(os.path.join(tok_path, "tokenizer.json"), "rb").read()
     print(f"tokenizer.json embutido: {len(tok_bytes):,} bytes")
 
@@ -95,7 +95,7 @@ def pack():
     exp_out = mat_q4_bytes(H, cfg.intermediate_size)  # output_linear [1024,512]
     exp_size = exp_in + exp_out       # 884736 = 216 * 4096
 
-    os.makedirs("artifacts", exist_ok=True)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     def make_header(hot_off, hot_size, dir_off, experts_off, tok_off, tok_size):
         vals = (MAGIC,
                 1,                                    # version
@@ -113,7 +113,7 @@ def pack():
                 experts_off, tok_off, tok_size)
         return struct.pack(HEAD_FMT, *vals) + b"\x00" * (PAGE - struct.calcsize(HEAD_FMT))
 
-    with open(OUT, "wb") as f:
+    with open(out_path, "wb") as f:
         f.write(make_header(0, 0, 0, 0, 0, 0))   # placeholder; patch no fim
         pos = PAGE
         tok_off = pos
@@ -167,7 +167,7 @@ def pack():
         f.seek(dir_off)
         f.write(b"".join(struct.pack("<QQII", *t) for t in entries))
 
-    sz = os.path.getsize(OUT)
+    sz = os.path.getsize(out_path)
     print(f"tamanho final .cromllm: {sz:,} bytes ({sz / 2**20:.1f} MiB)")
     print(f"expert_size={exp_size:,} (= {exp_size // PAGE} paginas 4K) | "
           f"experts={L * E} -> {L * E * exp_size / 2**20:.1f} MiB")
@@ -180,7 +180,7 @@ def pack():
     # ---- round-trip: reconstruir 1 matriz de atencao e 1 expert do arquivo ----
     ref_o = model.model.layers[0].self_attn.o_proj.weight.data.float()
     o_off = attn_off0 + qsz + 2 * ksz
-    with open(OUT, "rb") as f:
+    with open(out_path, "rb") as f:
         f.seek(o_off)
         blob = f.read(qsz)
     idx = torch.frombuffer(bytearray(blob[:H * (H // 2)]), dtype=torch.uint8).view(H, H // 2).numpy()
@@ -190,7 +190,7 @@ def pack():
     print(f"round-trip atencao L0.o_proj  : {ref_o.shape} -> erro L2 rel = {err_o:.4f}")
 
     ref_in = model.model.layers[0].block_sparse_moe.input_linear.weight.data[0].float()
-    with open(OUT, "rb") as f:
+    with open(out_path, "rb") as f:
         f.seek(entries[0][0])
         blob = f.read(exp_size)
     nidx = H * (H // 2)
@@ -220,10 +220,10 @@ def _norm6(t):
     return {"l2": float(t.norm()), "first6": [round(float(x), 6) for x in t[:6].tolist()]}
 
 
-def golden():
+def golden(model_id=MODEL_ID):
     torch.set_num_threads(6)
-    tok = AutoTokenizer.from_pretrained(MODEL_ID, local_files_only=True)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.bfloat16,
+    tok = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16,
                                                  low_cpu_mem_usage=True,
                                                  local_files_only=True)
     model.eval()
@@ -317,14 +317,14 @@ def golden():
         else:
             print(f"  {k}: l2={v['l2']:.6f} first6={v['first6']}")
 
-    ref = {"model_id": MODEL_ID, "text": GOLDEN_TEXT, "input_ids": ids,
+    ref = {"model_id": model_id, "text": GOLDEN_TEXT, "input_ids": ids,
            "routing": {str(k): v for k, v in rot.items()},
            "top10_logits": top10, "next_token": {"id": nxt, "token": nxt_txt},
            "checkpoints": checkpoints}
     os.makedirs("artifacts", exist_ok=True)
     with open(GOLDEN, "w", encoding="utf-8") as f:
         json.dump(ref, f, ensure_ascii=False, indent=2)
-    meta = {"model_id": MODEL_ID, "text": GOLDEN_TEXT, "n_input_ids": len(ids),
+    meta = {"model_id": model_id, "text": GOLDEN_TEXT, "n_input_ids": len(ids),
             "input_ids": ids,
             "routing_l0": rot[0], "routing_l23": rot[23],
             "top10_ids": [t["id"] for t in top10],
@@ -337,7 +337,14 @@ def golden():
 
 
 if __name__ == "__main__":
-    if "--golden" in sys.argv:
-        golden()
+    import argparse
+    parser = argparse.ArgumentParser(description="Empacotador de modelos para o formato .cromllm v1")
+    parser.add_argument("--model-id", default=MODEL_ID, help="ID do modelo HuggingFace (padrão: %(default)s)")
+    parser.add_argument("--out", default=OUT, help="Arquivo de saída .cromllm (padrão: %(default)s)")
+    parser.add_argument("--golden", action="store_true", help="Gera gabarito PyTorch BF16")
+    args = parser.parse_args()
+
+    if args.golden:
+        golden(model_id=args.model_id)
     else:
-        pack()
+        pack(model_id=args.model_id, out_path=args.out)

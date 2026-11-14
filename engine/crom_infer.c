@@ -39,8 +39,8 @@ static uint64_t rd_u64(const unsigned char *p) {
     return v;
 }
 
-static size_t mat_q4_bytes(int rows, int cols) {
-    return (size_t)rows * (cols / 2) + (size_t)rows * (cols / CROM_GROUP_SIZE) * 4;
+static size_t mat_q4_bytes(int rows, int cols, int group_size) {
+    return (size_t)rows * (cols / 2) + (size_t)rows * (cols / group_size) * 4;
 }
 
 static crom_q4_mat_t q4_mat_from(const unsigned char *p, int rows, int cols) {
@@ -150,18 +150,30 @@ static inline float silu(float x) { return x / (1.0f + expf(-x)); }
 
 struct lru_t {
     int cap;
+    int total_experts;
     int *slot_of_expert;
     int *lru_order;
     int *pos_in_lru;
 };
 
-static struct lru_t *lru_create(int cap) {
+static struct lru_t *lru_create(int cap, int total_experts) {
+    if (cap <= 0 || total_experts <= 0) return NULL;
     struct lru_t *l = calloc(1, sizeof(struct lru_t));
+    if (!l) return NULL;
     l->cap = cap;
-    l->slot_of_expert = calloc(CROM_NUM_DIR_ENTRIES, sizeof(int));
-    for (int i = 0; i < CROM_NUM_DIR_ENTRIES; i++) l->slot_of_expert[i] = -1;
-    l->lru_order = calloc(cap, sizeof(int));
-    l->pos_in_lru = calloc(cap, sizeof(int));
+    l->total_experts = total_experts;
+    l->slot_of_expert = calloc((size_t)total_experts, sizeof(int));
+    if (!l->slot_of_expert) { free(l); return NULL; }
+    for (int i = 0; i < total_experts; i++) l->slot_of_expert[i] = -1;
+    l->lru_order = calloc((size_t)cap, sizeof(int));
+    l->pos_in_lru = calloc((size_t)cap, sizeof(int));
+    if (!l->lru_order || !l->pos_in_lru) {
+        free(l->slot_of_expert);
+        free(l->lru_order);
+        free(l->pos_in_lru);
+        free(l);
+        return NULL;
+    }
     for (int i = 0; i < cap; i++) { l->lru_order[i] = i; l->pos_in_lru[i] = i; }
     return l;
 }
@@ -190,7 +202,7 @@ static void lru_destroy(struct lru_t *l) {
 
 static int read_expert_payload(crom_model_t *m, int expert_id, uint8_t *dst) {
     const crom_dir_entry_t *e = &m->dir[expert_id];
-    if (e->size_bytes != CROM_EXPERT_SIZE) return -1;
+    if (e->size_bytes == 0) return -1;
     ssize_t rd = pread(m->fd, dst, (size_t)e->size_bytes, (off_t)e->offset_bytes);
     if (rd < 0) return -1;
     if ((size_t)rd != e->size_bytes) return -1;
@@ -206,19 +218,19 @@ static int lru_get_expert(crom_model_t *m, int expert_id, uint8_t **out_ptr,
     if (slot >= 0) {
         m->cache_hits++;
         lru_touch(l, slot);
-        *out_ptr = (uint8_t *)m->expert_pool + (size_t)slot * CROM_EXPERT_SIZE;
+        *out_ptr = (uint8_t *)m->expert_pool + (size_t)slot * m->expert_size;
         return 0;
     }
     m->cache_misses++;
     int evict_slot = l->lru_order[l->cap - 1];
     int evict_id = -1;
-    for (int i = 0; i < CROM_NUM_DIR_ENTRIES; i++) {
+    for (int i = 0; i < l->total_experts; i++) {
         if (l->slot_of_expert[i] == evict_slot) { evict_id = i; break; }
     }
     if (evict_id >= 0) l->slot_of_expert[evict_id] = -1;
 
     double t0 = now_ms();
-    uint8_t *dst = (uint8_t *)m->expert_pool + (size_t)evict_slot * CROM_EXPERT_SIZE;
+    uint8_t *dst = (uint8_t *)m->expert_pool + (size_t)evict_slot * m->expert_size;
     if (read_expert_payload(m, expert_id, dst) != 0) return -1;
     double t1 = now_ms();
     m->ssd_io_ms += (t1 - t0);
@@ -236,42 +248,30 @@ static int lru_get_expert(crom_model_t *m, int expert_id, uint8_t **out_ptr,
 
 int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
                     int threads) {
+    return crom_model_open_ctx(path, m, cache_experts, threads, 2048);
+}
+
+int crom_model_open_ctx(const char *path, crom_model_t *m, int cache_experts,
+                        int threads, int max_seq) {
     memset(m, 0, sizeof(*m));
     m->threads = threads;
-    m->cache_experts = cache_experts;
-    m->streaming = (cache_experts < CROM_NUM_DIR_ENTRIES);
-    /* Copia o path para uso posterior no crom_tokenizer_data */
+    m->max_seq = (max_seq > 0) ? max_seq : 2048;
     m->path = strdup(path);
     if (!m->path) { perror("strdup"); return -1; }
-    m->streaming = (cache_experts < CROM_NUM_DIR_ENTRIES);
-    m->fd = open(m->path, m->streaming ? (O_RDONLY | O_DIRECT) : O_RDONLY);
-    if (m->fd < 0) { perror("open"); return -1; }
+
+    int probe_fd = open(m->path, O_RDONLY);
+    if (probe_fd < 0) { perror("open probe"); return -1; }
 
     struct stat st;
-    if (fstat(m->fd, &st) != 0) { perror("fstat"); return -1; }
+    if (fstat(probe_fd, &st) != 0) { perror("fstat"); close(probe_fd); return -1; }
     size_t fsize = (size_t)st.st_size;
 
-    unsigned char *file_buf = NULL;
-    if (!m->streaming) {
-        file_buf = malloc(fsize);
-        if (!file_buf) { perror("malloc file"); return -1; }
-        ssize_t rd = read(m->fd, file_buf, fsize);
-        if ((size_t)rd != fsize) { fprintf(stderr, "leitura incompleta\n"); return -1; }
-    }
-
     unsigned char hdr[CROM_HEADER_SIZE];
-    if (file_buf) {
-        memcpy(hdr, file_buf, CROM_HEADER_SIZE);
-    } else {
-        unsigned char *page = aligned_alloc(CROM_PAGE, CROM_PAGE);
-        if (!page) { perror("aligned_alloc header"); return -1; }
-        if (pread(m->fd, page, CROM_PAGE, 0) != CROM_PAGE) {
-            free(page);
-            fprintf(stderr, "leitura header falhou\n"); return -1;
-        }
-        memcpy(hdr, page, CROM_HEADER_SIZE);
-        free(page);
+    if (pread(probe_fd, hdr, CROM_HEADER_SIZE, 0) != CROM_HEADER_SIZE) {
+        fprintf(stderr, "leitura header falhou\n"); close(probe_fd); return -1;
     }
+    close(probe_fd);
+
     memcpy(m->magic_check, hdr, 8);
     if (memcmp(m->magic_check, CROM_MAGIC, 8) != 0) {
         fprintf(stderr, "magic invalido: %.8s\n", m->magic_check); return -1;
@@ -306,12 +306,34 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
     m->tokenizer_offset = rd_u64(hh + 128);
     m->tokenizer_size = rd_u64(hh + 136);
 
-    if (m->version != CROM_VERSION || m->vocab_size != CROM_VOCAB_SIZE ||
-        m->hidden_size != CROM_HIDDEN_SIZE || m->num_layers != CROM_NUM_LAYERS ||
-        m->num_attn_heads != CROM_NUM_Q_HEADS || m->num_kv_heads != CROM_NUM_KV_HEADS ||
-        m->head_dim != CROM_HEAD_DIM || m->num_local_experts != CROM_NUM_EXPERTS ||
-        m->group_size != CROM_GROUP_SIZE) {
-        fprintf(stderr, "dimensoes nao batem com spec\n"); return -1;
+    if (m->version != CROM_VERSION || m->vocab_size == 0 ||
+        m->hidden_size == 0 || m->num_layers == 0 ||
+        m->num_attn_heads == 0 || m->num_kv_heads == 0 ||
+        m->head_dim == 0 || m->num_local_experts == 0 ||
+        m->num_experts_per_tok == 0 || m->group_size == 0) {
+        fprintf(stderr, "dimensoes invalidas no header cromllm\n"); return -1;
+    }
+
+    m->total_experts = (int)(m->num_layers * m->num_local_experts);
+    size_t exp_in = mat_q4_bytes(2 * (int)m->intermediate_size, (int)m->hidden_size, (int)m->group_size);
+    size_t exp_out = mat_q4_bytes((int)m->hidden_size, (int)m->intermediate_size, (int)m->group_size);
+    m->expert_size = exp_in + exp_out;
+
+    if (cache_experts <= 0 || cache_experts > m->total_experts) {
+        cache_experts = m->total_experts;
+    }
+    m->cache_experts = cache_experts;
+    m->streaming = (cache_experts < m->total_experts);
+
+    m->fd = open(m->path, m->streaming ? (O_RDONLY | O_DIRECT) : O_RDONLY);
+    if (m->fd < 0) { perror("open fd"); return -1; }
+
+    unsigned char *file_buf = NULL;
+    if (!m->streaming) {
+        file_buf = malloc(fsize);
+        if (!file_buf) { perror("malloc file"); return -1; }
+        ssize_t rd = pread(m->fd, file_buf, fsize, 0);
+        if ((size_t)rd != fsize) { fprintf(stderr, "leitura incompleta\n"); return -1; }
     }
 
     m->hot_base = malloc(m->hot_size);
@@ -322,7 +344,7 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
         void *rbuf = aligned_alloc(CROM_PAGE, m->hot_size);
         if (!rbuf) { perror("aligned_alloc hot"); return -1; }
         if (pread(m->fd, rbuf, m->hot_size, (off_t)m->hot_offset) != (ssize_t)m->hot_size) {
-            fprintf(stderr, "leitura hot falhou\n"); return -1;
+            fprintf(stderr, "leitura hot falhou\n"); free(rbuf); return -1;
         }
         memcpy(m->hot_base, rbuf, m->hot_size);
         free(rbuf);
@@ -332,65 +354,70 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
     unsigned char *base = (unsigned char *)m->hot_base;
     size_t off = 0;
 
-    /* embed [vocab, hidden] F16 (mantém em F16 — ~96 MiB) */
-    size_t embed_raw = (size_t)CROM_VOCAB_SIZE * CROM_HIDDEN_SIZE * 2;
+    /* embed [vocab, hidden] F16 (mantém em F16) */
+    size_t embed_raw = (size_t)m->vocab_size * m->hidden_size * 2;
     size_t embed_pad = (embed_raw + CROM_PAGE - 1) & ~(CROM_PAGE - 1);
     m->embed_f16 = (uint16_t *)(base + off);
     off = embed_pad;
 
-    /* norms [49, hidden] FP32 */
-    size_t norms_raw = (size_t)49 * CROM_HIDDEN_SIZE * sizeof(float);
+    /* norms [(num_layers * 2 + 1), hidden] FP32 */
+    size_t num_norms = (size_t)(m->num_layers * 2 + 1);
+    size_t norms_raw = num_norms * m->hidden_size * sizeof(float);
     size_t norms_pad = (norms_raw + CROM_PAGE - 1) & ~(CROM_PAGE - 1);
     m->norms_f32 = malloc(norms_raw);
     if (!m->norms_f32) { perror("malloc norms"); return -1; }
     memcpy(m->norms_f32, base + off, norms_raw);
     off += norms_pad;
 
-    /* routers [24, 32, 1024] FP32 */
-    size_t routers_raw = (size_t)24 * 32 * CROM_HIDDEN_SIZE * sizeof(float);
+    /* routers [num_layers, num_local_experts, hidden] FP32 */
+    size_t routers_raw = (size_t)m->num_layers * m->num_local_experts * m->hidden_size * sizeof(float);
     size_t routers_pad = (routers_raw + CROM_PAGE - 1) & ~(CROM_PAGE - 1);
     m->routers_f32 = malloc(routers_raw);
     if (!m->routers_f32) { perror("malloc routers"); return -1; }
     memcpy(m->routers_f32, base + off, routers_raw);
     off += routers_pad;
 
-    /* inv_freq [32] FP32 */
-    size_t invf_raw = 32 * sizeof(float);
+    /* inv_freq [head_dim / 2] FP32 */
+    size_t invf_count = m->head_dim / 2;
+    size_t invf_raw = invf_count * sizeof(float);
     size_t invf_pad = (invf_raw + CROM_PAGE - 1) & ~(CROM_PAGE - 1);
-    m->inv_freq = malloc(32 * sizeof(float));
+    m->inv_freq = malloc(invf_raw);
     if (!m->inv_freq) { perror("malloc inv_freq"); return -1; }
     memcpy(m->inv_freq, base + off, invf_raw);
     off += invf_pad;
 
-    /* atencao Q4: 24 camadas q,k,v,o */
+    /* atencao Q4: num_layers camadas q,k,v,o */
     m->layers = calloc(m->num_layers, sizeof(crom_layer_t));
     if (!m->layers) { perror("malloc layers"); return -1; }
-    size_t qsz = mat_q4_bytes(CROM_HIDDEN_SIZE, CROM_HIDDEN_SIZE);
-    size_t ksz = mat_q4_bytes(CROM_NUM_KV_HEADS * CROM_HEAD_DIM, CROM_HIDDEN_SIZE);
+    size_t qsz = mat_q4_bytes((int)(m->num_attn_heads * m->head_dim), (int)m->hidden_size, (int)m->group_size);
+    size_t ksz = mat_q4_bytes((int)(m->num_kv_heads * m->head_dim), (int)m->hidden_size, (int)m->group_size);
+    size_t osz = mat_q4_bytes((int)m->hidden_size, (int)(m->num_attn_heads * m->head_dim), (int)m->group_size);
     for (int li = 0; li < (int)m->num_layers; li++) {
         crom_layer_t *L = &m->layers[li];
         crom_attn_t *A = &L->attn;
         size_t ao = off;
-        A->q_proj = q4_mat_from(base + ao, CROM_HIDDEN_SIZE, CROM_HIDDEN_SIZE);
+        A->q_proj = q4_mat_from(base + ao, m->num_attn_heads * m->head_dim, m->hidden_size);
         ao += qsz;
-        A->k_proj = q4_mat_from(base + ao, CROM_NUM_KV_HEADS * CROM_HEAD_DIM, CROM_HIDDEN_SIZE);
+        A->k_proj = q4_mat_from(base + ao, m->num_kv_heads * m->head_dim, m->hidden_size);
         ao += ksz;
-        A->v_proj = q4_mat_from(base + ao, CROM_NUM_KV_HEADS * CROM_HEAD_DIM, CROM_HIDDEN_SIZE);
+        A->v_proj = q4_mat_from(base + ao, m->num_kv_heads * m->head_dim, m->hidden_size);
         ao += ksz;
-        A->o_proj = q4_mat_from(base + ao, CROM_HIDDEN_SIZE, CROM_HIDDEN_SIZE);
-        ao += qsz;
+        A->o_proj = q4_mat_from(base + ao, m->hidden_size, m->num_attn_heads * m->head_dim);
+        ao += osz;
         off = ao;
-        L->router_weight = m->routers_f32 + (size_t)li * 32 * CROM_HIDDEN_SIZE;
+        L->router_weight = m->routers_f32 + (size_t)li * m->num_local_experts * m->hidden_size;
+        L->experts = calloc(m->num_local_experts, sizeof(crom_expert_t));
+        if (!L->experts) { perror("calloc layer experts"); return -1; }
     }
 
     if (file_buf) free(file_buf);
     file_buf = NULL;
 
     /* Diretorio de experts */
-    m->dir = calloc(CROM_NUM_DIR_ENTRIES, sizeof(crom_dir_entry_t));
+    m->dir = calloc(m->total_experts, sizeof(crom_dir_entry_t));
     if (!m->dir) { perror("malloc dir"); return -1; }
     {
-        size_t dir_sz = (size_t)CROM_NUM_DIR_ENTRIES * CROM_DIR_ENTRY_SIZE;
+        size_t dir_sz = (size_t)m->total_experts * 24;
         size_t dir_pad = (dir_sz + CROM_PAGE - 1) & ~(CROM_PAGE - 1);
         void *dbuf = aligned_alloc(CROM_PAGE, dir_pad);
         if (!dbuf) { perror("aligned_alloc dir"); return -1; }
@@ -399,7 +426,7 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
                     dir_sz, (unsigned long long)m->expert_dir_offset, errno);
             free(dbuf); return -1;
         }
-        for (int i = 0; i < CROM_NUM_DIR_ENTRIES; i++) {
+        for (int i = 0; i < m->total_experts; i++) {
             const unsigned char *d = (const unsigned char *)dbuf + (size_t)i * 24;
             m->dir[i].offset_bytes = rd_u64(d + 0);
             m->dir[i].size_bytes = rd_u64(d + 8);
@@ -410,18 +437,18 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
     }
 
     /* Pool de experts + LRU */
-    m->expert_pool = aligned_alloc(CROM_PAGE, (size_t)cache_experts * CROM_EXPERT_SIZE);
+    m->expert_pool = aligned_alloc(CROM_PAGE, (size_t)cache_experts * m->expert_size);
     if (!m->expert_pool) { perror("aligned_alloc pool"); return -1; }
-    m->lru = lru_create(cache_experts);
+    m->lru = lru_create(cache_experts, m->total_experts);
 
     long long preload_bytes = 0;
     if (!m->streaming) {
-        for (int i = 0; i < CROM_NUM_DIR_ENTRIES; i++) {
-            uint8_t *dst = (uint8_t *)m->expert_pool + (size_t)i * CROM_EXPERT_SIZE;
+        for (int i = 0; i < m->total_experts; i++) {
+            uint8_t *dst = (uint8_t *)m->expert_pool + (size_t)i * m->expert_size;
             if (read_expert_payload(m, i, dst) != 0) {
                 fprintf(stderr, "preload expert %d falhou\n", i); return -1;
             }
-            preload_bytes += CROM_EXPERT_SIZE;
+            preload_bytes += (long long)m->expert_size;
             m->lru->slot_of_expert[i] = i;
             m->lru->lru_order[i] = i;
             m->lru->pos_in_lru[i] = i;
@@ -432,23 +459,37 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
     m->ssd_stream_bytes_read = 0;
 
     /* KV-cache */
-    size_t kv_elems = (size_t)CROM_NUM_LAYERS * CROM_NUM_KV_HEADS * CROM_MAX_SEQ * CROM_HEAD_DIM;
+    size_t kv_elems = (size_t)m->num_layers * m->num_kv_heads * m->max_seq * m->head_dim;
     m->k_cache = aligned_alloc(CROM_PAGE, kv_elems * sizeof(float));
     m->v_cache = aligned_alloc(CROM_PAGE, kv_elems * sizeof(float));
     if (!m->k_cache || !m->v_cache) { perror("aligned_alloc kv"); return -1; }
     memset(m->k_cache, 0, kv_elems * sizeof(float));
     memset(m->v_cache, 0, kv_elems * sizeof(float));
 
-    /* Buffers de trabalho */
-    m->work1 = aligned_alloc(CROM_PAGE, (size_t)CROM_HIDDEN_SIZE * sizeof(float) * 8);
+    /* Buffers de trabalho proporcionais */
+    size_t max_dim = m->hidden_size;
+    if (m->num_attn_heads * m->head_dim > max_dim) max_dim = m->num_attn_heads * m->head_dim;
+    if (2 * (size_t)m->intermediate_size > max_dim) max_dim = 2 * (size_t)m->intermediate_size;
+
+    m->work1 = aligned_alloc(CROM_PAGE, max_dim * sizeof(float) * 8);
     if (!m->work1) { perror("aligned_alloc work"); return -1; }
 
     omp_set_num_threads(threads);
 
-    /* buffer dedicado p/ moe_acc (evita colisao com hidden_in) */
-    size_t wb = (size_t)CROM_HIDDEN_SIZE;
-    m->moe_acc_buf = aligned_alloc(CROM_PAGE, wb * sizeof(float));
+    m->moe_acc_buf = aligned_alloc(CROM_PAGE, m->hidden_size * sizeof(float));
     if (!m->moe_acc_buf) { perror("aligned_alloc moe_acc"); return -1; }
+
+    m->attn_scores = aligned_alloc(CROM_PAGE, (size_t)m->max_seq * sizeof(float));
+    if (!m->attn_scores) { perror("aligned_alloc attn_scores"); return -1; }
+
+    m->router_logits = malloc((size_t)m->num_local_experts * sizeof(float));
+    m->router_idx = malloc((size_t)m->num_local_experts * sizeof(int));
+    m->top_experts = malloc((size_t)m->num_experts_per_tok * sizeof(int));
+    m->top_weights = malloc((size_t)m->num_experts_per_tok * sizeof(float));
+    m->top_logits = malloc((size_t)m->num_experts_per_tok * sizeof(float));
+    if (!m->router_logits || !m->router_idx || !m->top_experts || !m->top_weights || !m->top_logits) {
+        perror("malloc routing buffers"); return -1;
+    }
 
     m->attn_ms = 0.0;
     m->moe_ms = 0.0;
@@ -458,8 +499,8 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
 }
 
 #define KV_OFF(m, li, kvh, pos) \
-    (((size_t)(li) * CROM_NUM_KV_HEADS + (kvh)) * (size_t)CROM_MAX_SEQ * CROM_HEAD_DIM \
-     + (size_t)(pos) * CROM_HEAD_DIM)
+    (((size_t)(li) * (size_t)(m)->num_kv_heads + (size_t)(kvh)) * (size_t)(m)->max_seq * (size_t)(m)->head_dim \
+     + (size_t)(pos) * (size_t)(m)->head_dim)
 
 /* ------------------------------------------------------------------ */
 /* camada: input_layernorm + atencao + residual                       */
@@ -468,12 +509,21 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
 int crom_layer_attn_resid(crom_model_t *m, int li, const float *hidden_in,
                           int pos, float *hidden_out) {
     double t0 = now_ms();
-    int H = CROM_HIDDEN_SIZE;
+    int H = m->hidden_size;
+    int head_dim = m->head_dim;
+    int num_q_heads = m->num_attn_heads;
+    int num_kv_heads = m->num_kv_heads;
+    int kv_group = num_q_heads / num_kv_heads;
+
+    size_t max_dim = H;
+    if (m->num_attn_heads * m->head_dim > max_dim) max_dim = m->num_attn_heads * m->head_dim;
+    if (2 * (size_t)m->intermediate_size > max_dim) max_dim = 2 * (size_t)m->intermediate_size;
+
     float *work1 = m->work1;
-    float *work2 = work1 + H;
-    float *work3 = work2 + H;
-    float *work4 = work3 + H;
-    float *work5 = work4 + H;
+    float *work2 = work1 + max_dim;
+    float *work3 = work2 + max_dim;
+    float *work4 = work3 + max_dim;
+    float *work5 = work4 + max_dim;
 
     float *rms_w_in = m->norms_f32 + (size_t)li * 2 * H;
     crom_rms_norm(rms_w_in, hidden_in, H, m->rms_norm_eps, work1);
@@ -483,31 +533,33 @@ int crom_layer_attn_resid(crom_model_t *m, int li, const float *hidden_in,
     q4_matvec(&A->k_proj, work1, work3, m->threads);
     q4_matvec(&A->v_proj, work1, work4, m->threads);
 
-    for (int h = 0; h < CROM_NUM_Q_HEADS; h++)
-        rope_split_half(work2 + h * CROM_HEAD_DIM, pos, m->inv_freq, CROM_HEAD_DIM);
-    for (int h = 0; h < CROM_NUM_KV_HEADS; h++)
-        rope_split_half(work3 + h * CROM_HEAD_DIM, pos, m->inv_freq, CROM_HEAD_DIM);
+    for (int h = 0; h < num_q_heads; h++)
+        rope_split_half(work2 + h * head_dim, pos, m->inv_freq, head_dim);
+    for (int h = 0; h < num_kv_heads; h++)
+        rope_split_half(work3 + h * head_dim, pos, m->inv_freq, head_dim);
 
     float *k_cache = m->k_cache;
     float *v_cache = m->v_cache;
-    for (int h = 0; h < CROM_NUM_KV_HEADS; h++) {
-        memcpy(k_cache + KV_OFF(m, li, h, pos), work3 + h * CROM_HEAD_DIM,
-               CROM_HEAD_DIM * sizeof(float));
-        memcpy(v_cache + KV_OFF(m, li, h, pos), work4 + h * CROM_HEAD_DIM,
-               CROM_HEAD_DIM * sizeof(float));
+    for (int h = 0; h < num_kv_heads; h++) {
+        memcpy(k_cache + KV_OFF(m, li, h, pos), work3 + h * head_dim,
+               head_dim * sizeof(float));
+        memcpy(v_cache + KV_OFF(m, li, h, pos), work4 + h * head_dim,
+               head_dim * sizeof(float));
     }
 
     int seqlen = pos + 1;
+    if (seqlen > m->max_seq) seqlen = m->max_seq;
     float *attn_out = work5;
-    for (int h = 0; h < CROM_NUM_Q_HEADS; h++) {
-        int kvh = h / 2;
-        float *q = work2 + h * CROM_HEAD_DIM;
-        float scores[CROM_MAX_SEQ];
+    float *scores = m->attn_scores;
+
+    for (int h = 0; h < num_q_heads; h++) {
+        int kvh = h / kv_group;
+        float *q = work2 + h * head_dim;
         float maxs = -1e30f;
         for (int t = 0; t < seqlen; t++) {
             float s = 0.0f;
             const float *k = k_cache + KV_OFF(m, li, kvh, t);
-            for (int d = 0; d < CROM_HEAD_DIM; d++) s += q[d] * k[d];
+            for (int d = 0; d < head_dim; d++) s += q[d] * k[d];
             s *= m->attention_multiplier;
             scores[t] = s;
             if (s > maxs) maxs = s;
@@ -515,12 +567,12 @@ int crom_layer_attn_resid(crom_model_t *m, int li, const float *hidden_in,
         float sum = 0.0f;
         for (int t = 0; t < seqlen; t++) { scores[t] = expf(scores[t] - maxs); sum += scores[t]; }
         float inv = 1.0f / sum;
-        float *acc = attn_out + h * CROM_HEAD_DIM;
-        for (int d = 0; d < CROM_HEAD_DIM; d++) acc[d] = 0.0f;
+        float *acc = attn_out + h * head_dim;
+        for (int d = 0; d < head_dim; d++) acc[d] = 0.0f;
         for (int t = 0; t < seqlen; t++) {
             float w = scores[t] * inv;
             const float *v = v_cache + KV_OFF(m, li, kvh, t);
-            for (int d = 0; d < CROM_HEAD_DIM; d++) acc[d] += v[d] * w;
+            for (int d = 0; d < head_dim; d++) acc[d] += v[d] * w;
         }
     }
 
@@ -542,68 +594,87 @@ int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
                           int *top8_out, float *top8_w_out) {
     double t0 = now_ms();
     (void)pos;
-    int H = CROM_HIDDEN_SIZE;
-    int I = CROM_INTER_SIZE;
+    int H = m->hidden_size;
+    int I = m->intermediate_size;
+    int num_exp = m->num_local_experts;
+    int num_top = m->num_experts_per_tok;
+
+    size_t max_dim = H;
+    if (m->num_attn_heads * m->head_dim > max_dim) max_dim = m->num_attn_heads * m->head_dim;
+    if (2 * (size_t)I > max_dim) max_dim = 2 * (size_t)I;
+
     float *work1 = m->work1;
-    float *work2 = work1 + H;
-    float *work3 = work2 + H;
-    float *work4 = work3 + H;
+    float *work2 = work1 + max_dim;
+    float *work3 = work2 + max_dim;
+    float *work4 = work3 + max_dim;
 
     float *rms_w_post = m->norms_f32 + (size_t)li * 2 * H + H;
     crom_rms_norm(rms_w_post, hidden_in, H, m->rms_norm_eps, work1);
 
     float *router_w = m->layers[li].router_weight;
-    float router_logits[CROM_NUM_EXPERTS];
-    for (int e = 0; e < CROM_NUM_EXPERTS; e++) {
+    float *router_logits = m->router_logits;
+    int *router_idx = m->router_idx;
+    for (int e = 0; e < num_exp; e++) {
         float s = 0.0f;
         const float *rw = router_w + (size_t)e * H;
         for (int i = 0; i < H; i++) s += work1[i] * rw[i];
         router_logits[e] = s;
+        router_idx[e] = e;
     }
-    int idx[CROM_NUM_EXPERTS];
-    for (int e = 0; e < CROM_NUM_EXPERTS; e++) idx[e] = e;
-    for (int i = 0; i < CROM_NUM_EXPERTS; i++)
-        for (int j = i + 1; j < CROM_NUM_EXPERTS; j++)
-            if (router_logits[idx[j]] > router_logits[idx[i]]) {
-                int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
+
+    for (int i = 0; i < num_top; i++) {
+        int max_j = i;
+        for (int j = i + 1; j < num_exp; j++) {
+            if (router_logits[router_idx[j]] > router_logits[router_idx[max_j]]) {
+                max_j = j;
             }
-    int top8[CROM_EXPERTS_PER_TOK];
-    for (int i = 0; i < CROM_EXPERTS_PER_TOK; i++) top8[i] = idx[i];
-    if (top8_out) memcpy(top8_out, top8, sizeof(top8));
+        }
+        if (max_j != i) {
+            int tmp = router_idx[i];
+            router_idx[i] = router_idx[max_j];
+            router_idx[max_j] = tmp;
+        }
+    }
+
+    int *top_exp = m->top_experts;
+    for (int i = 0; i < num_top; i++) top_exp[i] = router_idx[i];
+    if (top8_out) memcpy(top8_out, top_exp, num_top * sizeof(int));
 
     float ml = -1e30f;
-    for (int i = 0; i < CROM_EXPERTS_PER_TOK; i++)
-        if (router_logits[top8[i]] > ml) ml = router_logits[top8[i]];
-    float top8_logits[CROM_EXPERTS_PER_TOK];
-    float s8 = 0.0f;
-    for (int i = 0; i < CROM_EXPERTS_PER_TOK; i++) {
-        top8_logits[i] = expf(router_logits[top8[i]] - ml);
-        s8 += top8_logits[i];
+    for (int i = 0; i < num_top; i++) {
+        float l = router_logits[top_exp[i]];
+        if (l > ml) ml = l;
     }
-    float inv8 = 1.0f / s8;
-    float w8[CROM_EXPERTS_PER_TOK];
-    for (int i = 0; i < CROM_EXPERTS_PER_TOK; i++)
-        w8[i] = top8_logits[i] * inv8;
-    if (top8_w_out) memcpy(top8_w_out, w8, sizeof(w8));
+    float *top_logits = m->top_logits;
+    float *top_weights = m->top_weights;
+    float sK = 0.0f;
+    for (int i = 0; i < num_top; i++) {
+        top_logits[i] = expf(router_logits[top_exp[i]] - ml);
+        sK += top_logits[i];
+    }
+    float invK = 1.0f / sK;
+    for (int i = 0; i < num_top; i++) {
+        top_weights[i] = top_logits[i] * invK;
+    }
+    if (top8_w_out) memcpy(top8_w_out, top_weights, num_top * sizeof(float));
 
     float *moe_acc = m->moe_acc_buf;
     for (int i = 0; i < H; i++) moe_acc[i] = 0.0f;
 
-    for (int ei = 0; ei < CROM_EXPERTS_PER_TOK; ei++) {
-        int expert_id = top8[ei];
-        float w = w8[ei];
-        int dir_id = li * CROM_NUM_EXPERTS + expert_id;
+    for (int ei = 0; ei < num_top; ei++) {
+        int expert_id = top_exp[ei];
+        float w = top_weights[ei];
+        int dir_id = li * num_exp + expert_id;
         crom_expert_t *E = &m->layers[li].experts[expert_id];
         uint8_t *payload = NULL;
         if (m->streaming) {
             lru_get_expert(m, dir_id, &payload, NULL);
         } else {
-            payload = (uint8_t *)m->expert_pool + (size_t)dir_id * CROM_EXPERT_SIZE;
+            payload = (uint8_t *)m->expert_pool + (size_t)dir_id * m->expert_size;
         }
-        size_t in_idx = (size_t)H * (H / 2);
-        E->input_linear = q4_mat_from(payload, H, H);
-        size_t out_idx_off = in_idx + (size_t)H * (H / CROM_GROUP_SIZE) * sizeof(float);
-        E->output_linear = q4_mat_from(payload + out_idx_off, H, I);
+        size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
+        E->input_linear = q4_mat_from(payload, 2 * I, H);
+        E->output_linear = q4_mat_from(payload + in_sz, H, I);
 
         q4_matvec(&E->input_linear, work1, work3, m->threads);
         for (int i = 0; i < I; i++) {
@@ -627,7 +698,7 @@ int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
 /* ------------------------------------------------------------------ */
 
 int crom_embed(crom_model_t *m, int token_id, float *hidden) {
-    int H = CROM_HIDDEN_SIZE;
+    int H = m->hidden_size;
     const uint16_t *embed = m->embed_f16;
     const uint16_t *src = embed + (size_t)token_id * H;
     int i = 0;
@@ -650,11 +721,15 @@ int crom_embed(crom_model_t *m, int token_id, float *hidden) {
 int crom_forward(crom_model_t *m, const int *input_ids, int n_ids,
                  int position, float *hidden, float *out_logits) {
     (void)n_ids;
-    int H = CROM_HIDDEN_SIZE;
-    float *work1 = m->work1;
-    float *work2 = work1 + H;
+    int H = m->hidden_size;
+    size_t max_dim = H;
+    if (m->num_attn_heads * m->head_dim > max_dim) max_dim = m->num_attn_heads * m->head_dim;
+    if (2 * (size_t)m->intermediate_size > max_dim) max_dim = 2 * (size_t)m->intermediate_size;
 
-crom_embed(m, input_ids[position], hidden);
+    float *work1 = m->work1;
+    float *work2 = work1 + max_dim;
+
+    crom_embed(m, input_ids[position], hidden);
     for (int li = 0; li < (int)m->num_layers; li++) {
         crom_layer_attn_resid(m, li, hidden, position, work2);
         crom_layer_moe_resid(m, li, work2, position, hidden, NULL, NULL);
@@ -666,7 +741,7 @@ crom_embed(m, input_ids[position], hidden);
 
     /* lm_head tied (F16C + FMA vector accumulator — hsum256 uma vez por linha) */
     double t0 = now_ms();
-    int vocab = CROM_VOCAB_SIZE;
+    int vocab = m->vocab_size;
     const uint16_t *embed = m->embed_f16;
 #pragma omp parallel for schedule(static)
     for (int v = 0; v < vocab; v++) {
@@ -731,7 +806,7 @@ int crom_eos_id(void) {
 }
 
 void crom_reset_kv(crom_model_t *m) {
-    size_t kv_elems = (size_t)CROM_NUM_LAYERS * CROM_NUM_KV_HEADS * CROM_MAX_SEQ * CROM_HEAD_DIM;
+    size_t kv_elems = (size_t)m->num_layers * m->num_kv_heads * m->max_seq * m->head_dim;
     memset(m->k_cache, 0, kv_elems * sizeof(float));
     memset(m->v_cache, 0, kv_elems * sizeof(float));
     m->attn_ms = 0.0;
@@ -765,11 +840,42 @@ void crom_model_close(crom_model_t *m) {
     free(m->norms_f32);
     free(m->routers_f32);
     free(m->inv_freq);
-    free(m->layers);
+    if (m->layers) {
+        for (int li = 0; li < (int)m->num_layers; li++) {
+            free(m->layers[li].experts);
+        }
+        free(m->layers);
+    }
     free(m->k_cache);
     free(m->v_cache);
     free(m->work1);
     free(m->moe_acc_buf);
+    free(m->attn_scores);
+    free(m->router_logits);
+    free(m->router_idx);
+    free(m->top_experts);
+    free(m->top_weights);
+    free(m->top_logits);
     if (m->fd >= 0) close(m->fd);
     if (m->path) free((void*)m->path);
+}
+
+/* ------------------------------------------------------------------ */
+/* Getters para Go/C                                                  */
+/* ------------------------------------------------------------------ */
+
+int crom_vocab_size(const crom_model_t *m) {
+    return (int)m->vocab_size;
+}
+
+int crom_hidden_size(const crom_model_t *m) {
+    return (int)m->hidden_size;
+}
+
+int crom_num_experts_total(const crom_model_t *m) {
+    return m->total_experts;
+}
+
+int crom_max_seq(const crom_model_t *m) {
+    return m->max_seq;
 }

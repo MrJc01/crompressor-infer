@@ -1041,4 +1041,47 @@ dependência de Python no runtime.
 
 ---
 
+## [EXP-011] — Motor C+Go 100% dinâmico por header, --ctx 2048 e --repeat-penalty
+
+**Data:** 2026-11-14
+**Fase:** 1 / infra
+**Caminho:** infra (motor dinâmico para Marco A e Higiene)
+**Status:** concluído
+
+### Objetivo
+
+Tornar todas as dimensões de modelo dinâmicas em C e Go, eliminando tamanhos hardcoded (vocab, hidden, inter, layers, heads, kv_heads, experts, head_dim, group_size), adicionando `--ctx` (padrão 2048 com KV-cache e buffers proporcionais) e amostragem com `--repeat-penalty` (padrão 1.10, janela 64) para eliminar loops repetitivos na geração em português.
+
+### Hipótese
+
+1. O motor C+Go deve ler as dimensões diretamente do cabeçalho `.cromllm`, suportando modelos arbitrários sem recompilação, mantendo exatidão numérica bit-idêntica nos testes de regressão do Granite-1B (`check_exp008.py` PASS nos 3 modos: 768, 576, 384).
+2. O KV-cache alocado para `max_seq=2048` deve funcionar com overhead mínimo de RAM.
+3. A aplicação de `--repeat-penalty 1.15` no Prompt 1 deve quebrar completamente o loop repetitivo observado no EXP-010 mantendo throughput >50 tok/s.
+
+### Código/Script
+
+- `engine/crom_infer.h`, `engine/crom_infer.c`: remoção de constantes fixas, suporte a `crom_model_open_ctx(path, m, cache_experts, threads, max_seq)` e getters `crom_vocab_size`, `crom_hidden_size`, `crom_num_experts_total`, `crom_max_seq`. Buffers de KV-cache, scores de atenção e roteamento MoE alocados dinamicamente.
+- `engine/crom_cli.c`: flag `--ctx` (padrão 2048) e buffers dinâmicos.
+- `internal/engine/engine.go`: métodos `VocabSize()`, `HiddenSize()`, `TotalExperts()`, `MaxSeq()`, e opção `MaxSeq` em `Config`.
+- `internal/engine/gen_test.go`: adaptado para dimensões dinâmicas com `LockOSThread()` e `debug.SetGCPercent(-1)`.
+- `cmd/crom-infer/main.go`: flags `--ctx` (2048), `--repeat-penalty` (1.10), `--repeat-window` (64), alocações de `hidden` e `logits` dinâmicas por modelo, fórmula padrão de penalidade por token único na janela.
+- `tools/pack_cromllm.py`: argumentos CLI `--model-id` e `--out` com defaults preservados.
+
+### Validação de Regressão e Benchmarks
+
+1. `check_exp008.py` (checkpoints vs PyTorch Golden):
+   - Modo 768 (RAM): PASS, decode 56,56 tok/s, prefill 57,49 tok/s, RSS 985,9 MB, cache hit 100%.
+   - Modo 576 (SSD 75%): PASS, decode 14,72 tok/s, RSS 823,9 MB, cache hit 88,53%.
+   - Modo 384 (SSD 50%): PASS, decode 4,62 tok/s, RSS 662,0 MB, cache hit 65,01%.
+   - Tokens gerados nos 3 modos: 100% idênticos.
+
+2. Impacto de `--repeat-penalty` no Prompt 1 (PT-BR: "Explique em 3 frases curtas como funciona uma tabela hash."):
+   - `--repeat-penalty 1.0` (sem penalidade): Frase 2 é cópia idêntica da Frase 1 ("Uma tabela hash é como uma tabela de identificação de dados..."). Decode: 55,08 tok/s.
+   - `--repeat-penalty 1.15`: Loop eliminado completamente. Frase 1 e Frase 2 com conteúdos distintos e coerentes. Decode: 51,92 tok/s.
+
+### Conclusão
+
+Motor C e CLI Go desacoplados de qualquer constante fixa do Granite-1B. Suporte nativo a contexto ampliado (`--ctx 2048`) e amostragem refinada com `--repeat-penalty`. Base pronta para o Marco Futuro A (empacotamento e execução de MoEs maiores que a RAM).
+
+
 

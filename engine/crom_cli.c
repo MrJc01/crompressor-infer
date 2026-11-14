@@ -50,51 +50,58 @@ static void topk(const float *logits, int vocab, int k, int *ids_out, float *val
 
 int main(int argc, char **argv) {
     const char *model_path = "artifacts/granite-1b.cromllm";
-    int ids[CROM_MAX_SEQ];
+    int max_seq = 2048;
+    int *ids = NULL;
     int n_ids = 0;
     int steps = 32;
     int threads = 6;
-    int cache_experts = CROM_NUM_DIR_ENTRIES;
+    int cache_experts = -1;
     int dump_ckpt = 0;
+    const char *ids_str = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) model_path = argv[++i];
-        else if (!strcmp(argv[i], "--ids") && i + 1 < argc) {
-            n_ids = parse_ids(argv[++i], ids, CROM_MAX_SEQ);
-        } else if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_str = argv[++i];
+        else if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cache-experts") && i + 1 < argc) cache_experts = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) max_seq = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-ckpt")) dump_ckpt = 1;
         else { fprintf(stderr, "arg desconhecido: %s\n", argv[i]); return 2; }
     }
-    if (n_ids == 0) { fprintf(stderr, "use --ids\n"); return 2; }
-    if (cache_experts < 1 || cache_experts > CROM_NUM_DIR_ENTRIES) {
-        fprintf(stderr, "--cache-experts deve ser 1..%d\n", CROM_NUM_DIR_ENTRIES); return 2;
-    }
+    if (!ids_str) { fprintf(stderr, "use --ids\n"); return 2; }
+
+    ids = malloc((size_t)max_seq * sizeof(int));
+    if (!ids) { perror("malloc ids"); return 1; }
+    n_ids = parse_ids(ids_str, ids, max_seq);
+    if (n_ids == 0) { fprintf(stderr, "nenhum id valido em --ids\n"); free(ids); return 2; }
 
     omp_set_num_threads(threads);
 
     crom_model_t m;
     double t0 = omp_get_wtime();
-    if (crom_model_open(model_path, &m, cache_experts, threads) != 0) {
-        fprintf(stderr, "falha ao abrir modelo\n"); return 1;
+    if (crom_model_open_ctx(model_path, &m, cache_experts, threads, max_seq) != 0) {
+        fprintf(stderr, "falha ao abrir modelo\n"); free(ids); return 1;
     }
     double t1 = omp_get_wtime();
     double load_ms = (t1 - t0) * 1000.0;
 
-    int H = CROM_HIDDEN_SIZE;
-    size_t logits_sz = ((size_t)CROM_VOCAB_SIZE * sizeof(float) + CROM_PAGE - 1) & ~(CROM_PAGE - 1);
+    int H = m.hidden_size;
+    int V = m.vocab_size;
+    int L = m.num_layers;
+    size_t logits_sz = ((size_t)V * sizeof(float) + CROM_PAGE - 1) & ~(CROM_PAGE - 1);
     float *hidden = aligned_alloc(4096, H * sizeof(float));
     float *hidden2 = aligned_alloc(4096, H * sizeof(float));
     float *logits = aligned_alloc(4096, logits_sz);
     int top10_ids[10];
     float top10_vals[10];
 
-    int cur[CROM_MAX_SEQ];
+    int *cur = malloc((size_t)m.max_seq * sizeof(int));
+    int *gen_ids = malloc((size_t)m.max_seq * sizeof(int));
+    if (!cur || !gen_ids) { perror("malloc cur/gen_ids"); return 1; }
     int ncur = n_ids;
     memcpy(cur, ids, n_ids * sizeof(int));
 
-    int gen_ids[CROM_MAX_SEQ];
     int n_gen = 0;
     double prefill_t0 = omp_get_wtime();
     for (int p = 0; p < n_ids - 1; p++) {
@@ -129,33 +136,33 @@ int main(int argc, char **argv) {
         printf("]\n");
         memcpy(hidden, hidden2, H * sizeof(float));
 
-        for (int li = 1; li < 23; li++) {
+        for (int li = 1; li < L - 1; li++) {
             crom_layer_attn_resid(&m, li, hidden, n_ids - 1, hidden2);
             memcpy(hidden, hidden2, H * sizeof(float));
             crom_layer_moe_resid(&m, li, hidden, n_ids - 1, hidden2, NULL, NULL);
             memcpy(hidden, hidden2, H * sizeof(float));
         }
 
-        crom_layer_attn_resid(&m, 23, hidden, n_ids - 1, hidden2);
+        crom_layer_attn_resid(&m, L - 1, hidden, n_ids - 1, hidden2);
         memcpy(hidden, hidden2, H * sizeof(float));
-        int top8_l23[8]; float w8_l23[8];
-        crom_layer_moe_resid(&m, 23, hidden, n_ids - 1, hidden2, top8_l23, w8_l23);
+        int top8_lL[8]; float w8_lL[8];
+        crom_layer_moe_resid(&m, L - 1, hidden, n_ids - 1, hidden2, top8_lL, w8_lL);
         vec_l2_first6(hidden2, H, &l2, f6);
-        printf("after_L23: l2=%.6f first6=[%.6f, %.6f, %.6f, %.6f, %.6f, %.6f]\n",
-               l2, f6[0], f6[1], f6[2], f6[3], f6[4], f6[5]);
-        printf("router L23: experts=[");
-        for (int i = 0; i < 8; i++) printf("%d%s", top8_l23[i], i < 7 ? ", " : "");
+        printf("after_L%d: l2=%.6f first6=[%.6f, %.6f, %.6f, %.6f, %.6f, %.6f]\n",
+               L - 1, l2, f6[0], f6[1], f6[2], f6[3], f6[4], f6[5]);
+        printf("router L%d: experts=[", L - 1);
+        for (int i = 0; i < 8; i++) printf("%d%s", top8_lL[i], i < 7 ? ", " : "");
         printf("] pesos=[");
-        for (int i = 0; i < 8; i++) printf("%.6f%s", w8_l23[i], i < 7 ? ", " : "");
+        for (int i = 0; i < 8; i++) printf("%.6f%s", w8_lL[i], i < 7 ? ", " : "");
         printf("]\n");
 
-/* lm_head sobre hidden apos L23 (final_norm sobre hidden2 apos moe L23) */
+        /* lm_head sobre hidden apos ultima camada (final_norm sobre hidden2) */
         float *fn = aligned_alloc(4096, H * sizeof(float));
         float *final_norm_w = m.norms_f32 + (size_t)(m.num_layers * 2) * H;
         crom_rms_norm(final_norm_w, hidden2, H, m.rms_norm_eps, fn);
         const uint16_t *embed = m.embed_f16;
 #pragma omp parallel for schedule(static)
-        for (int v = 0; v < CROM_VOCAB_SIZE; v++) {
+        for (int v = 0; v < V; v++) {
             float s = 0.0f;
             const uint16_t *ev = embed + (size_t)v * H;
             int i = 0;
@@ -172,7 +179,7 @@ int main(int argc, char **argv) {
         }
         free(fn);
 
-        topk(logits, CROM_VOCAB_SIZE, 10, top10_ids, top10_vals);
+        topk(logits, V, 10, top10_ids, top10_vals);
         printf("top-10 logits:");
         for (int i = 0; i < 10; i++)
             printf(" [%d]=%.4f", top10_ids[i], top10_vals[i]);
@@ -182,10 +189,10 @@ int main(int argc, char **argv) {
     /* geracao */
     double decode_t0 = omp_get_wtime();
     int pos = n_ids - 1;
-    for (int s = 0; s < steps && pos < CROM_MAX_SEQ - 1; s++) {
+    for (int s = 0; s < steps && pos < m.max_seq - 1; s++) {
         crom_forward(&m, cur, ncur, pos, hidden, logits);
         int nt_id; float nt_val;
-        topk(logits, CROM_VOCAB_SIZE, 1, &nt_id, &nt_val);
+        topk(logits, V, 1, &nt_id, &nt_val);
         gen_ids[n_gen++] = nt_id;
         cur[ncur++] = nt_id;
         pos++;
@@ -223,11 +230,14 @@ int main(int argc, char **argv) {
            "attn_ms=%.1f moe_ms=%.1f lm_head_ms=%.1f threads=%d cache=%d\n",
            load_ms, prefill_tok, decode_tok, (double)rss_kb / 1024.0,
            hit_pct, (double)bytes / (1024.0 * 1024.0), (double)stream_bytes / (1024.0 * 1024.0), io_ms,
-           attn_ms, moe_ms, lm_head_ms, threads, cache_experts);
+           attn_ms, moe_ms, lm_head_ms, threads, m.cache_experts);
 
     crom_model_close(&m);
     free(hidden);
     free(hidden2);
     free(logits);
+    free(ids);
+    free(cur);
+    free(gen_ids);
     return 0;
 }

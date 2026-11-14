@@ -26,9 +26,10 @@ type Model struct {
 
 // Config holds model configuration
 type Config struct {
-	ModelPath     string
-	CacheExperts  int
-	Threads       int
+	ModelPath    string
+	CacheExperts int
+	Threads      int
+	MaxSeq       int
 }
 
 // Open loads the model
@@ -39,12 +40,15 @@ func Open(config Config) (*Model, error) {
 	if config.CacheExperts <= 0 {
 		config.CacheExperts = 768
 	}
+	if config.MaxSeq <= 0 {
+		config.MaxSeq = 2048
+	}
 
 	cPath := C.CString(config.ModelPath)
 	defer C.free(unsafe.Pointer(cPath))
 
 	var model C.crom_model_t
-	ret := C.crom_model_open(cPath, &model, C.int(config.CacheExperts), C.int(config.Threads))
+	ret := C.crom_model_open_ctx(cPath, &model, C.int(config.CacheExperts), C.int(config.Threads), C.int(config.MaxSeq))
 	if ret != 0 {
 		return nil, errors.New("failed to open model")
 	}
@@ -52,6 +56,26 @@ func Open(config Config) (*Model, error) {
 	m := &Model{model: model}
 	runtime.SetFinalizer(m, (*Model).Close)
 	return m, nil
+}
+
+// VocabSize returns model vocabulary size
+func (m *Model) VocabSize() int {
+	return int(C.crom_vocab_size(&m.model))
+}
+
+// HiddenSize returns model hidden dimension
+func (m *Model) HiddenSize() int {
+	return int(C.crom_hidden_size(&m.model))
+}
+
+// TotalExperts returns total experts across all layers
+func (m *Model) TotalExperts() int {
+	return int(C.crom_num_experts_total(&m.model))
+}
+
+// MaxSeq returns model maximum context sequence length
+func (m *Model) MaxSeq() int {
+	return int(C.crom_max_seq(&m.model))
 }
 
 // Close releases resources

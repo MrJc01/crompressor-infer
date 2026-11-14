@@ -15,15 +15,18 @@ import (
 )
 
 type Config struct {
-	ModelPath    string
-	Prompt       string
-	Chat         bool
-	MaxTokens    int
-	Threads      int
-	CacheExperts int
-	Stream       bool
-	JSONOutput   bool
-	TokenizeOnly bool
+	ModelPath     string
+	Prompt        string
+	Chat          bool
+	MaxTokens     int
+	Threads       int
+	CacheExperts  int
+	Ctx           int
+	RepeatPenalty float64
+	RepeatWindow  int
+	Stream        bool
+	JSONOutput    bool
+	TokenizeOnly  bool
 }
 
 func main() {
@@ -34,6 +37,9 @@ func main() {
 	flag.IntVar(&cfg.MaxTokens, "max-tokens", 128, "Max tokens to generate")
 	flag.IntVar(&cfg.Threads, "threads", 6, "Number of threads")
 	flag.IntVar(&cfg.CacheExperts, "cache-experts", 768, "Number of experts to cache in RAM")
+	flag.IntVar(&cfg.Ctx, "ctx", 2048, "Context window size")
+	flag.Float64Var(&cfg.RepeatPenalty, "repeat-penalty", 1.10, "Repetition penalty factor (1.0 = disabled)")
+	flag.IntVar(&cfg.RepeatWindow, "repeat-window", 64, "Repetition penalty window size")
 	flag.BoolVar(&cfg.Stream, "stream", false, "Stream output in real-time")
 	flag.BoolVar(&cfg.JSONOutput, "json", false, "Output JSON with metrics")
 	flag.BoolVar(&cfg.TokenizeOnly, "tokenize-only", false, "Only tokenize the prompt and print JSON ids")
@@ -66,6 +72,7 @@ func main() {
 		ModelPath:    cfg.ModelPath,
 		CacheExperts: cfg.CacheExperts,
 		Threads:      cfg.Threads,
+		MaxSeq:       cfg.Ctx,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load model: %v\n", err)
@@ -99,8 +106,12 @@ func main() {
 	}
 
 	// Generate
-	hidden := make([]float32, 1024)
-	logits := make([]float32, 49155)
+	vocabSize := model.VocabSize()
+	hiddenSize := model.HiddenSize()
+	maxSeq := model.MaxSeq()
+
+	hidden := make([]float32, hiddenSize)
+	logits := make([]float32, vocabSize)
 	generated := make([]int, 0, cfg.MaxTokens)
 	promptLen := len(inputIDs)
 
@@ -115,13 +126,35 @@ func main() {
 	// no re-sending of the whole history into the model).
 	decodeStart := time.Now()
 	pos := len(inputIDs) - 1
-	for step := 0; step < cfg.MaxTokens && pos < 512; step++ {
+	for step := 0; step < cfg.MaxTokens && pos < maxSeq-1; step++ {
 		model.Forward(inputIDs, pos, hidden, logits)
+
+		// Apply repetition penalty
+		if cfg.RepeatPenalty > 0 && cfg.RepeatPenalty != 1.0 && cfg.RepeatWindow > 0 {
+			start := len(inputIDs) - cfg.RepeatWindow
+			if start < 0 {
+				start = 0
+			}
+			window := inputIDs[start:]
+			seen := make(map[int]bool, len(window))
+			penalty := float32(cfg.RepeatPenalty)
+			for _, id := range window {
+				if id < 0 || id >= vocabSize || seen[id] {
+					continue
+				}
+				seen[id] = true
+				if logits[id] > 0 {
+					logits[id] /= penalty
+				} else {
+					logits[id] *= penalty
+				}
+			}
+		}
 
 		// Sample next token (greedy)
 		nextID := 0
 		maxLogit := float32(-1e30)
-		for i := 0; i < 49155; i++ {
+		for i := 0; i < vocabSize; i++ {
 			if logits[i] > maxLogit {
 				maxLogit = logits[i]
 				nextID = i
