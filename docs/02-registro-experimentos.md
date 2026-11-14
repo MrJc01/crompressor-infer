@@ -1210,6 +1210,75 @@ Validar o layout de compressão compacto `C1_TOPK` (Codebook K-Means $d=4, K=256
 
 O formato híbrido `Hibrido_Q4_C1_topk8` demonstrou a melhor relação qualidade vs compressão: atinge 3,75 bits/peso médios com degradação contida de PPL (76,69 vs 63,15 do Q4 e 56,51 do BF16), reduzindo 21,3% da transferência de SSD nas camadas centrais. O formato `.cromllm` está formalizado e implementado com múltiplos formatos heterogêneos de experts alinhados a 4K.
 
+---
+
+## [EXP-013B] — Kernel C C1_TOPK_K8 Direto e Duelo Híbrido vs Q4 em Streaming SSD
+
+**Data:** 2026-11-14
+**Fase:** 2
+**Caminho:** B (Codebook + Lookup Table) / C (Híbrido) / infra (Motor C de Inferência)
+**Status:** concluído
+
+### Objetivo
+
+Implementar suporte nativo a `format_id = 2` (`C1_TOPK_K8`) e `format_id = 3` (`C1_TOPK_K4`) no motor de inferência C (`engine/`), com kernels de cálculo direto `c1_matvec` e `c1_matmul_batch` que computam a projeção matricial sem reconstruir a matriz descomprimida na RAM. Executar validação unitária contra PyTorch (`tools/check_c1_kernel.py`), verificar regressão zero no baseline Q4 (`tools/check_exp008.py`) e realizar o duelo comparativo oficial entre `granite-1b.cromllm` (Q4 puro) e `granite-1b-hybrid.cromllm` (Híbrido Q4 + C1_TOPK_K8) nos modos de cache 768, 576 e 384 com `--repeat-penalty 1.15`.
+
+### Hipótese
+
+1. O cálculo direto no kernel C usando residência de codebook em cache L1 ($256 \times 4$ floats = 4096 bytes) e acumulação do produto ponto escalar/vetorial ($\text{acc} += s\_base \cdot (\text{sum\_base} + \alpha \cdot \text{sum\_delta})$) deve atingir exatidão numérica estrita ($< 1 \times 10^{-4}$ erro L2 vs PyTorch) sem qualquer alocação dinâmica de pesos na memória principal.
+2. Em modos de cache limitado sob streaming de SSD SATA (576 e 384 experts), o modelo híbrido deve apresentar **maior taxa de decodificação (tok/s)** que o modelo Q4, comprovando que a redução de 21,3% no payload por expert atenua diretamente o gargalo de largura de banda do disco.
+3. No modo RAM Full (768), o Q4 deve manter maior throughput devido à simplicidade da descompactação nibble AVX2 vs lookups de codebook, mas o híbrido deve economizar ~92 MB de RAM e arquivo em disco.
+
+### Implementação
+
+- `engine/crom_infer.h`:
+  - Estrutura `crom_c1_mat_t` (ponteiros diretos para `codebook`, `codes`, `deltas`, `scales` em FP16).
+  - União em `crom_expert_t` suportando tanto matrizes Q4 (`q4_in`, `q4_out`) quanto C1 (`c1_in`, `c1_out`).
+  - Protótipos exportados de `mat_c1_bytes`, `c1_mat_from`, `c1_matvec`, `c1_matmul_batch`.
+- `engine/crom_infer.c`:
+  - Verificação do cabeçalho aceitando `expert_format` 1, 2 ou 3.
+  - Cálculo de `max_expert_size` dinâmico a partir das entradas do diretório (`884.736 B` no modelo híbrido), dimensionando o pool para acomodar qualquer bloco.
+  - Leituras via `pread()` (síncrona e assíncrona com `pthread`) buscando o tamanho exato de cada entrada (`dir[id].size_bytes`: `696.320 B` para C1_K8 e `884.736 B` para Q4).
+  - Kernel `c1_matvec` com acumulação direta em registradores AVX/FMA.
+  - Kernel `c1_matmul_batch` com expansão de grupo de 64 pesos em registradores locais amortizados por lote de $B$ tokens.
+  - Helpers polimórficos `crom_eval_expert_matvec` (decode) e `crom_eval_expert_tokens` (prefill) roteando transparentemente por `format_id`.
+
+### Validação Unitária e de Regressão
+
+1. **Kernel C vs PyTorch (`tools/check_c1_kernel.py` em L11/E0):**
+   - `c1_matvec` `input_linear` [1024, 1024]: erro L2 rel = **$3,1563 \times 10^{-7}$** (PASS)
+   - `c1_matvec` `output_linear` [1024, 512]: erro L2 rel = **$2,2279 \times 10^{-7}$** (PASS)
+   - `c1_matmul_batch` `input_linear` [B=4, 1024]: erro L2 rel = **$3,1135 \times 10^{-7}$** (PASS)
+   - `c1_matmul_batch` `output_linear` [B=7, 512]: erro L2 rel = **$2,5546 \times 10^{-7}$** (PASS)
+   - Tolerância de $< 1 \times 10^{-4}$ atendida com folga de 3 ordens de grandeza.
+
+2. **Regressão Q4 (`tools/check_exp008.py` em 768, 576, 384):**
+   - Tokens gerados bit-idênticos nos 3 modos (`idênticos nos 3 modos: True`).
+   - Checkpoints de camadas e roteamento idênticos ao PyTorch golden.
+   - Status: **PASS**.
+
+### Duelo Oficial: Q4 vs Híbrido (`exp013b_hybrid_duel.json`)
+
+Testado nos 4 prompts padrão com `--repeat-penalty 1.15`, 6 threads, limite de 128 tokens:
+
+| Modo de Cache | Modelo | Decode (tok/s) | Prefill (tok/s) | SSD Stream Total (MB) | RSS Pico (MB) | Vantagem / Impacto |
+|---|---|---|---|---|---|---|
+| **768 (RAM Full)** | Q4 Puro | **50,44** | 94,16 | 0,0 | 1019,3 | Q4 +75% decode (compute-bound) |
+| **768 (RAM Full)** | Híbrido C1_K8 | 28,78 | 40,72 | 0,0 | **927,2** | Híbrido economiza **92,1 MB RAM** |
+| **576 (75% RAM)** | Q4 Puro | 11,49 | 22,99 | 8251,0 | 857,2 | — |
+| **576 (75% RAM)** | Híbrido C1_K8 | **13,73** | 15,11 | **6442,0** | **832,6** | **Híbrido +19,5% mais rápido em decode** (-1,81 GB I/O, -21,9%) |
+| **384 (50% RAM)** | Q4 Puro | 4,59 | 25,08 | 24399,6 | 695,4 | — |
+| **384 (50% RAM)** | Híbrido C1_K8 | **5,20** | 20,41 | **20429,8** | **695,0** | **Híbrido +13,3% mais rápido em decode** (-3,97 GB I/O, -16,3%) |
+
+### Qualidade do Texto Gerado
+
+O modelo híbrido preservou a coerência sintática e o alinhamento com as instruções. Em inglês técnico (Prompt 2: definição de MoE), a resposta do modelo híbrido foi fluida e estruturada ("A Mixture-of-Experts neural network is a type of deep learning model that combines the predictions of multiple experts..."). No Prompt 3 (função C sem texto extra), o híbrido respeitou a restrição abrindo diretamente o bloco de código. Em português, manteve conformidade com as respostas do modelo base de 1B parâmetros. Nos 3 modos de cache, a saída foi 100% determinística.
+
+### Conclusão
+
+Hipótese comprovada: **em cenários de streaming SSD com restrição de memória (576 e 384 experts), o formato híbrido supera o Q4 puro em velocidade de decodificação (+19,5% em cache 576 e +13,3% em cache 384)**, pois a economia de ~21,9% na quantidade de bytes transferidos via SSD SATA supera a sobrecarga computacional da desquantização por codebook. O motor C agora é plenamente heterogêneo e pronto para suportar modelos de maior porte.
+
+
 
 
 

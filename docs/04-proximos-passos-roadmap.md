@@ -133,6 +133,8 @@ RAM, que é o diferencial real frente a soluções `mmap`.
 - [x] **Adicionar flag `--repeat-penalty`** na amostragem (**concluído no EXP-011**).
 - [x] **Motor C e Go 100% dinâmico** por header `.cromllm` sem hardcoding de dimensões (**concluído no EXP-011**).
 - [x] **Batch Prefill GEMM e Prefetch Assíncrono via pthread** (**concluído no EXP-012**).
+- [x] **Layout Compacto C1_TOPK, format_id = 2 e Perfil Híbrido** (**concluído no EXP-013A**).
+- [x] **Kernel C C1_TOPK direto e Duelo Híbrido vs Q4 em SSD Streaming** (**concluído no EXP-013B**).
 - [ ] Suportar **múltiplos modelos** no cabeçalho `.cromllm` (catálogo/versão).
 - [x] Manter `crompressor/`, `artifacts/`, `bin/`, `*.a`, `*.o` fora do versionamento.
 
@@ -142,6 +144,6 @@ RAM, que é o diferencial real frente a soluções `mmap`.
 
 1. **EXP-011** (Motor Dinâmico + `--ctx 2048` + `--repeat-penalty`) — **CONCLUÍDO**.
 2. **EXP-012** (Batch Prefill GEMM + Prefetch Assíncrono SSD via `pthread` + pinning LRU) — **CONCLUÍDO**.
-3. **B.2 `C1_v2`** (reduz bytes por token e viabiliza o Marco A).
-4. **A — modelo maior que a RAM** (usa B.1/B.2 como base).
-5. **C — deltas P2P / multi-fine-tune** (diferencial de produto).
+3. **EXP-013A / EXP-013B** (`C1_TOPK_K8` híbrido: 3,75 bits/peso, +19,5% tok/s em SSD 576) — **CONCLUÍDO**.
+4. **Marco A — modelo maior que a RAM** (ex.: OLMoE 1B-7B sob orçamento restrito de RAM).
+5. **Marco C — deltas P2P / multi-fine-tune** (diferencial de produto).

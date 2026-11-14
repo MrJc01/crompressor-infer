@@ -168,6 +168,154 @@ static void q4_matmul_batch(const crom_q4_mat_t *W, const float *X, int B, int s
 }
 
 /* ------------------------------------------------------------------ */
+/* Kernels C1_TOPK (format_id = 2 / 3)                                */
+/* ------------------------------------------------------------------ */
+
+size_t mat_c1_bytes(int rows, int cols, int k_delta) {
+    size_t cb = 256 * 4 * sizeof(float);
+    size_t codes = (size_t)rows * (cols / 4);
+    size_t deltas = (size_t)rows * (cols / CROM_GROUP_SIZE) * k_delta;
+    size_t scales = (size_t)rows * (cols / CROM_GROUP_SIZE) * 2 * sizeof(uint16_t);
+    return cb + codes + deltas + scales;
+}
+
+crom_c1_mat_t c1_mat_from(const uint8_t *p, int rows, int cols, int k_delta) {
+    crom_c1_mat_t M;
+    M.rows = rows;
+    M.cols = cols;
+    M.k_delta = k_delta;
+    size_t off = 0;
+    M.codebook = (const float *)(p + off);
+    off += 256 * 4 * sizeof(float);
+    M.codes = p + off;
+    off += (size_t)rows * (cols / 4);
+    M.deltas = p + off;
+    off += (size_t)rows * (cols / CROM_GROUP_SIZE) * k_delta;
+    M.scales = (const uint16_t *)(p + off);
+    return M;
+}
+
+void c1_matvec(const crom_c1_mat_t *W, const float *x, float *out, int threads) {
+    (void)threads;
+    const int rows = W->rows;
+    const int cols = W->cols;
+    const int ng = cols / CROM_GROUP_SIZE;
+    const int k_delta = W->k_delta;
+    const float *codebook = W->codebook;
+    const uint8_t *codes = W->codes;
+    const uint8_t *deltas = W->deltas;
+    const uint16_t *scales = W->scales;
+    const size_t codes_stride = (size_t)(cols / 4);
+
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; r++) {
+        const uint8_t *r_codes = codes + (size_t)r * codes_stride;
+        const size_t r_gi_base = (size_t)r * ng;
+        float row_acc = 0.0f;
+
+        for (int g = 0; g < ng; g++) {
+            size_t gi = r_gi_base + g;
+            float s_base = _cvtsh_ss(scales[gi * 2 + 0]);
+            float alpha  = _cvtsh_ss(scales[gi * 2 + 1]);
+
+            const float *xg = x + g * CROM_GROUP_SIZE;
+            const uint8_t *g_codes = r_codes + g * 16;
+
+            __m128 acc4 = _mm_setzero_ps();
+            for (int b = 0; b < 16; b++) {
+                uint8_t c = g_codes[b];
+                __m128 cb_v = _mm_loadu_ps(&codebook[(size_t)c * 4]);
+                __m128 xb_v = _mm_loadu_ps(&xg[b * 4]);
+                acc4 = _mm_fmadd_ps(cb_v, xb_v, acc4);
+            }
+            __m128 shuf = _mm_movehdup_ps(acc4);
+            __m128 sums = _mm_add_ps(acc4, shuf);
+            shuf = _mm_movehl_ps(shuf, sums);
+            sums = _mm_add_ss(sums, shuf);
+            float sum_base = _mm_cvtss_f32(sums);
+
+            const uint8_t *d_ptr = deltas + gi * k_delta;
+            float sum_delta = 0.0f;
+            for (int k = 0; k < k_delta; k++) {
+                uint8_t d = d_ptr[k];
+                int pos = d & 63;
+                int sign_neg = (d >> 6) & 1;
+                float v = xg[pos];
+                sum_delta += sign_neg ? -v : v;
+            }
+
+            row_acc += s_base * (sum_base + alpha * sum_delta);
+        }
+        out[r] = row_acc;
+    }
+}
+
+void c1_matmul_batch(const crom_c1_mat_t *W, const float *X, int B, int stride_X,
+                     float *Out, int stride_Out, int threads) {
+    (void)threads;
+    if (B == 1) {
+        c1_matvec(W, X, Out, threads);
+        return;
+    }
+    const int rows = W->rows;
+    const int cols = W->cols;
+    const int ng = cols / CROM_GROUP_SIZE;
+    const int k_delta = W->k_delta;
+    const float *codebook = W->codebook;
+    const uint8_t *codes = W->codes;
+    const uint8_t *deltas = W->deltas;
+    const uint16_t *scales = W->scales;
+    const size_t codes_stride = (size_t)(cols / 4);
+
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; r++) {
+        const uint8_t *r_codes = codes + (size_t)r * codes_stride;
+        const size_t r_gi_base = (size_t)r * ng;
+
+        __m256 acc[B];
+        for (int b = 0; b < B; b++) acc[b] = _mm256_setzero_ps();
+
+        for (int g = 0; g < ng; g++) {
+            size_t gi = r_gi_base + g;
+            float s_base = _cvtsh_ss(scales[gi * 2 + 0]);
+            float alpha  = _cvtsh_ss(scales[gi * 2 + 1]);
+
+            const uint8_t *g_codes = r_codes + g * 16;
+            float W_group[64];
+            for (int b = 0; b < 16; b++) {
+                uint8_t c = g_codes[b];
+                _mm_storeu_ps(&W_group[b * 4], _mm_loadu_ps(&codebook[(size_t)c * 4]));
+            }
+
+            const uint8_t *d_ptr = deltas + gi * k_delta;
+            for (int k = 0; k < k_delta; k++) {
+                uint8_t d = d_ptr[k];
+                int pos = d & 63;
+                int sign_neg = (d >> 6) & 1;
+                W_group[pos] += sign_neg ? -alpha : alpha;
+            }
+
+            __m256 sb_v = _mm256_set1_ps(s_base);
+            __m256 w_vec[8];
+            for (int i = 0; i < 8; i++) {
+                w_vec[i] = _mm256_mul_ps(_mm256_loadu_ps(&W_group[i * 8]), sb_v);
+            }
+
+            for (int b = 0; b < B; b++) {
+                const float *xg = X + (size_t)b * stride_X + g * CROM_GROUP_SIZE;
+                for (int i = 0; i < 8; i++) {
+                    acc[b] = _mm256_fmadd_ps(w_vec[i], _mm256_loadu_ps(xg + i * 8), acc[b]);
+                }
+            }
+        }
+
+        for (int b = 0; b < B; b++) {
+            Out[(size_t)b * stride_Out + r] = hsum256(acc[b]);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* RMSNorm FP32 (exportado)                                           */
 /* ------------------------------------------------------------------ */
 
@@ -488,8 +636,10 @@ int crom_model_open_ctx(const char *path, crom_model_t *m, int cache_experts,
         m->hidden_size == 0 || m->num_layers == 0 ||
         m->num_attn_heads == 0 || m->num_kv_heads == 0 ||
         m->head_dim == 0 || m->num_local_experts == 0 ||
-        m->num_experts_per_tok == 0 || m->group_size == 0) {
-        fprintf(stderr, "dimensoes invalidas no header cromllm\n"); return -1;
+        m->num_experts_per_tok == 0 || m->group_size == 0 ||
+        (m->expert_format != 1 && m->expert_format != 2 && m->expert_format != 3)) {
+        fprintf(stderr, "dimensoes ou formato invalidos no header cromllm (expert_format=%u)\n", m->expert_format);
+        return -1;
     }
 
     m->total_experts = (int)(m->num_layers * m->num_local_experts);
@@ -614,6 +764,17 @@ int crom_model_open_ctx(const char *path, crom_model_t *m, int cache_experts,
         free(dbuf);
     }
 
+    /* Calcula max_expert_size dinamicamente a partir do diretório */
+    size_t max_expert_size = 0;
+    for (int i = 0; i < m->total_experts; i++) {
+        if (m->dir[i].size_bytes > max_expert_size) {
+            max_expert_size = (size_t)m->dir[i].size_bytes;
+        }
+    }
+    if (max_expert_size > 0) {
+        m->expert_size = max_expert_size;
+    }
+
     /* Pool de experts + LRU */
     m->expert_pool = aligned_alloc(CROM_PAGE, (size_t)cache_experts * m->expert_size);
     if (!m->expert_pool) { perror("aligned_alloc pool"); return -1; }
@@ -626,7 +787,7 @@ int crom_model_open_ctx(const char *path, crom_model_t *m, int cache_experts,
             if (read_expert_payload(m, i, dst) != 0) {
                 fprintf(stderr, "preload expert %d falhou\n", i); return -1;
             }
-            preload_bytes += (long long)m->expert_size;
+            preload_bytes += (long long)m->dir[i].size_bytes;
             m->lru->slot_of_expert[i] = i;
             m->lru->lru_order[i] = i;
             m->lru->pos_in_lru[i] = i;
@@ -771,6 +932,103 @@ int crom_layer_attn_resid(crom_model_t *m, int li, const float *hidden_in,
 }
 
 /* ------------------------------------------------------------------ */
+/* Avaliação polimórfica de expert (Q4 ou C1_TOPK)                   */
+/* ------------------------------------------------------------------ */
+
+static inline void crom_eval_expert_matvec(crom_model_t *m, int li, int expert_id, int dir_id,
+                                          const uint8_t *payload, float w,
+                                          const float *work1, float *work3, float *work4, float *moe_acc) {
+    int H = m->hidden_size;
+    int I = m->intermediate_size;
+    int fmt = m->dir[dir_id].format_id;
+    crom_expert_t *E = &m->layers[li].experts[expert_id];
+    E->format_id = fmt;
+
+    if (fmt == 1) {
+        size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
+        E->q4_in = q4_mat_from(payload, 2 * I, H);
+        E->q4_out = q4_mat_from(payload + in_sz, H, I);
+        q4_matvec(&E->q4_in, work1, work3, m->threads);
+        for (int i = 0; i < I; i++) {
+            float g = silu(work3[i]);
+            float u = work3[I + i];
+            work3[i] = g * u;
+        }
+        q4_matvec(&E->q4_out, work3, work4, m->threads);
+    } else {
+        int k_delta = (fmt == 2) ? 8 : 4;
+        size_t in_sz = mat_c1_bytes(2 * I, H, k_delta);
+        E->c1_in = c1_mat_from(payload, 2 * I, H, k_delta);
+        E->c1_out = c1_mat_from(payload + in_sz, H, I, k_delta);
+        c1_matvec(&E->c1_in, work1, work3, m->threads);
+        for (int i = 0; i < I; i++) {
+            float g = silu(work3[i]);
+            float u = work3[I + i];
+            work3[i] = g * u;
+        }
+        c1_matvec(&E->c1_out, work3, work4, m->threads);
+    }
+    for (int i = 0; i < H; i++) moe_acc[i] += work4[i] * w;
+}
+
+static inline void crom_eval_expert_tokens(crom_model_t *m, int li, int e, int dir_id,
+                                          const uint8_t *payload, int C,
+                                          const int *tokens, const float *weights,
+                                          const float *norm_buf, float *moe_inter, float *moe_out) {
+    int H = m->hidden_size;
+    int I = m->intermediate_size;
+    int in_exp_dim = 2 * I;
+    int fmt = m->dir[dir_id].format_id;
+    crom_expert_t *E = &m->layers[li].experts[e];
+    E->format_id = fmt;
+
+    if (fmt == 1) {
+        size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
+        E->q4_in = q4_mat_from(payload, 2 * I, H);
+        E->q4_out = q4_mat_from(payload + in_sz, H, I);
+        for (int c = 0; c < C; c++) {
+            int b = tokens[c];
+            float w = weights[c];
+            const float *x = norm_buf + (size_t)b * H;
+            float *inter = moe_inter + (size_t)b * in_exp_dim;
+            float out_v[H];
+
+            q4_matvec(&E->q4_in, x, inter, m->threads);
+            for (int k = 0; k < I; k++) {
+                float g = silu(inter[k]);
+                float u = inter[I + k];
+                inter[k] = g * u;
+            }
+            q4_matvec(&E->q4_out, inter, out_v, m->threads);
+            float *mb = moe_out + (size_t)b * H;
+            for (int k = 0; k < H; k++) mb[k] += out_v[k] * w;
+        }
+    } else {
+        int k_delta = (fmt == 2) ? 8 : 4;
+        size_t in_sz = mat_c1_bytes(2 * I, H, k_delta);
+        E->c1_in = c1_mat_from(payload, 2 * I, H, k_delta);
+        E->c1_out = c1_mat_from(payload + in_sz, H, I, k_delta);
+        for (int c = 0; c < C; c++) {
+            int b = tokens[c];
+            float w = weights[c];
+            const float *x = norm_buf + (size_t)b * H;
+            float *inter = moe_inter + (size_t)b * in_exp_dim;
+            float out_v[H];
+
+            c1_matvec(&E->c1_in, x, inter, m->threads);
+            for (int k = 0; k < I; k++) {
+                float g = silu(inter[k]);
+                float u = inter[I + k];
+                inter[k] = g * u;
+            }
+            c1_matvec(&E->c1_out, inter, out_v, m->threads);
+            float *mb = moe_out + (size_t)b * H;
+            for (int k = 0; k < H; k++) mb[k] += out_v[k] * w;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* camada: post_attn_layernorm + moe + residual                       */
 /* ------------------------------------------------------------------ */
 
@@ -852,20 +1110,8 @@ int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
             int expert_id = top_exp[ei];
             float w = top_weights[ei];
             int dir_id = li * num_exp + expert_id;
-            crom_expert_t *E = &m->layers[li].experts[expert_id];
             uint8_t *payload = (uint8_t *)m->expert_pool + (size_t)dir_id * m->expert_size;
-            size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
-            E->input_linear = q4_mat_from(payload, 2 * I, H);
-            E->output_linear = q4_mat_from(payload + in_sz, H, I);
-
-            q4_matvec(&E->input_linear, work1, work3, m->threads);
-            for (int i = 0; i < I; i++) {
-                float g = silu(work3[i]);
-                float u = work3[I + i];
-                work3[i] = g * u;
-            }
-            q4_matvec(&E->output_linear, work3, work4, m->threads);
-            for (int i = 0; i < H; i++) moe_acc[i] += work4[i] * w;
+            crom_eval_expert_matvec(m, li, expert_id, dir_id, payload, w, work1, work3, work4, moe_acc);
         }
     } else if (m->sync_io || !m->aio) {
         /* Modo Streaming Síncrono (--sync-io) */
@@ -873,21 +1119,9 @@ int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
             int expert_id = top_exp[ei];
             float w = top_weights[ei];
             int dir_id = li * num_exp + expert_id;
-            crom_expert_t *E = &m->layers[li].experts[expert_id];
             uint8_t *payload = NULL;
             lru_get_expert(m, dir_id, &payload, NULL);
-            size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
-            E->input_linear = q4_mat_from(payload, 2 * I, H);
-            E->output_linear = q4_mat_from(payload + in_sz, H, I);
-
-            q4_matvec(&E->input_linear, work1, work3, m->threads);
-            for (int i = 0; i < I; i++) {
-                float g = silu(work3[i]);
-                float u = work3[I + i];
-                work3[i] = g * u;
-            }
-            q4_matvec(&E->output_linear, work3, work4, m->threads);
-            for (int i = 0; i < H; i++) moe_acc[i] += work4[i] * w;
+            crom_eval_expert_matvec(m, li, expert_id, dir_id, payload, w, work1, work3, work4, moe_acc);
         }
     } else {
         /* Modo Streaming Assíncrono via worker pthread com sobreposição de compute/IO */
@@ -958,20 +1192,9 @@ int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
             if (!is_miss) {
                 int expert_id = top_exp[ei];
                 float w = top_weights[ei];
-                crom_expert_t *E = &m->layers[li].experts[expert_id];
+                int dir_id = li * num_exp + expert_id;
                 uint8_t *payload = payloads[ei];
-                size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
-                E->input_linear = q4_mat_from(payload, 2 * I, H);
-                E->output_linear = q4_mat_from(payload + in_sz, H, I);
-
-                q4_matvec(&E->input_linear, work1, work3, m->threads);
-                for (int i = 0; i < I; i++) {
-                    float g = silu(work3[i]);
-                    float u = work3[I + i];
-                    work3[i] = g * u;
-                }
-                q4_matvec(&E->output_linear, work3, work4, m->threads);
-                for (int i = 0; i < H; i++) moe_acc[i] += work4[i] * w;
+                crom_eval_expert_matvec(m, li, expert_id, dir_id, payload, w, work1, work3, work4, moe_acc);
             }
         }
 
@@ -995,20 +1218,9 @@ int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
                 int slot = aio->reqs[mi].slot;
                 lru_touch(l, slot);
 
-                crom_expert_t *E = &m->layers[li].experts[expert_id];
+                int dir_id = li * num_exp + expert_id;
                 uint8_t *payload = payloads[ei];
-                size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
-                E->input_linear = q4_mat_from(payload, 2 * I, H);
-                E->output_linear = q4_mat_from(payload + in_sz, H, I);
-
-                q4_matvec(&E->input_linear, work1, work3, m->threads);
-                for (int i = 0; i < I; i++) {
-                    float g = silu(work3[i]);
-                    float u = work3[I + i];
-                    work3[i] = g * u;
-                }
-                q4_matvec(&E->output_linear, work3, work4, m->threads);
-                for (int i = 0; i < H; i++) moe_acc[i] += work4[i] * w;
+                crom_eval_expert_matvec(m, li, expert_id, dir_id, payload, w, work1, work3, work4, moe_acc);
             }
         }
 
@@ -1421,29 +1633,10 @@ int crom_forward_batch(crom_model_t *m, const int *input_ids, int n_tokens,
                 }
                 if (!is_miss) {
                     int C = exp_count[e];
-                    crom_expert_t *E = &m->layers[li].experts[e];
+                    int dir_id = li * num_exp + e;
                     uint8_t *payload = exp_payload[e];
-                    size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
-                    E->input_linear = q4_mat_from(payload, 2 * I, H);
-                    E->output_linear = q4_mat_from(payload + in_sz, H, I);
-
-                    for (int c = 0; c < C; c++) {
-                        int b = exp_tokens[e][c];
-                        float w = exp_weights[e][c];
-                        const float *x = norm_buf + (size_t)b * H;
-                        float *inter = moe_inter + (size_t)b * in_exp_dim;
-                        float out_v[H];
-
-                        q4_matvec(&E->input_linear, x, inter, m->threads);
-                        for (int k = 0; k < I; k++) {
-                            float g = silu(inter[k]);
-                            float u = inter[I + k];
-                            inter[k] = g * u;
-                        }
-                        q4_matvec(&E->output_linear, inter, out_v, m->threads);
-                        float *mb = moe_out + (size_t)b * H;
-                        for (int k = 0; k < H; k++) mb[k] += out_v[k] * w;
-                    }
+                    crom_eval_expert_tokens(m, li, e, dir_id, payload, C,
+                                            exp_tokens[e], exp_weights[e], norm_buf, moe_inter, moe_out);
                 }
             }
 
@@ -1465,29 +1658,10 @@ int crom_forward_batch(crom_model_t *m, const int *input_ids, int n_tokens,
                     lru_touch(l, slot);
 
                     int C = exp_count[e];
-                    crom_expert_t *E = &m->layers[li].experts[e];
+                    int dir_id = li * num_exp + e;
                     uint8_t *payload = exp_payload[e];
-                    size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
-                    E->input_linear = q4_mat_from(payload, 2 * I, H);
-                    E->output_linear = q4_mat_from(payload + in_sz, H, I);
-
-                    for (int c = 0; c < C; c++) {
-                        int b = exp_tokens[e][c];
-                        float w = exp_weights[e][c];
-                        const float *x = norm_buf + (size_t)b * H;
-                        float *inter = moe_inter + (size_t)b * in_exp_dim;
-                        float out_v[H];
-
-                        q4_matvec(&E->input_linear, x, inter, m->threads);
-                        for (int k = 0; k < I; k++) {
-                            float g = silu(inter[k]);
-                            float u = inter[I + k];
-                            inter[k] = g * u;
-                        }
-                        q4_matvec(&E->output_linear, inter, out_v, m->threads);
-                        float *mb = moe_out + (size_t)b * H;
-                        for (int k = 0; k < H; k++) mb[k] += out_v[k] * w;
-                    }
+                    crom_eval_expert_tokens(m, li, e, dir_id, payload, C,
+                                            exp_tokens[e], exp_weights[e], norm_buf, moe_inter, moe_out);
                 }
             }
 
@@ -1501,29 +1675,10 @@ int crom_forward_batch(crom_model_t *m, const int *input_ids, int n_tokens,
             for (int i = 0; i < n_active; i++) {
                 int e = active_experts[i];
                 int C = exp_count[e];
-                crom_expert_t *E = &m->layers[li].experts[e];
+                int dir_id = li * num_exp + e;
                 uint8_t *payload = exp_payload[e];
-                size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
-                E->input_linear = q4_mat_from(payload, 2 * I, H);
-                E->output_linear = q4_mat_from(payload + in_sz, H, I);
-
-                for (int c = 0; c < C; c++) {
-                    int b = exp_tokens[e][c];
-                    float w = exp_weights[e][c];
-                    const float *x = norm_buf + (size_t)b * H;
-                    float *inter = moe_inter + (size_t)b * in_exp_dim;
-                    float out_v[H];
-
-                    q4_matvec(&E->input_linear, x, inter, m->threads);
-                    for (int k = 0; k < I; k++) {
-                        float g = silu(inter[k]);
-                        float u = inter[I + k];
-                        inter[k] = g * u;
-                    }
-                    q4_matvec(&E->output_linear, inter, out_v, m->threads);
-                    float *mb = moe_out + (size_t)b * H;
-                    for (int k = 0; k < H; k++) mb[k] += out_v[k] * w;
-                }
+                crom_eval_expert_tokens(m, li, e, dir_id, payload, C,
+                                        exp_tokens[e], exp_weights[e], norm_buf, moe_inter, moe_out);
             }
         }
 

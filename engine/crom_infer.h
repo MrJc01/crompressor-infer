@@ -55,8 +55,29 @@ typedef struct {
 } crom_attn_t;
 
 typedef struct {
-    crom_q4_mat_t input_linear;
-    crom_q4_mat_t output_linear;
+    const float    *codebook; /* [256 * 4] FP32 = 4096 bytes */
+    const uint8_t  *codes;    /* [rows, cols / 4] */
+    const uint8_t  *deltas;   /* [rows, (cols / 64) * k_delta] */
+    const uint16_t *scales;   /* [rows, (cols / 64) * 2] FP16: s_base, alpha */
+    int rows;
+    int cols;
+    int k_delta;
+} crom_c1_mat_t;
+
+typedef struct {
+    int format_id;
+    union {
+        struct {
+            crom_q4_mat_t input_linear;
+            crom_q4_mat_t output_linear;
+        };
+        struct {
+            crom_q4_mat_t q4_in;
+            crom_q4_mat_t q4_out;
+        };
+    };
+    crom_c1_mat_t c1_in;
+    crom_c1_mat_t c1_out;
 } crom_expert_t;
 
 typedef struct {
@@ -165,6 +186,13 @@ void crom_stats(const crom_model_t *m, long long *hits, long long *misses,
                 long long *bytes, long long *stream_bytes, double *io_ms,
                 double *attn_ms, double *moe_ms, double *lm_head_ms);
 void crom_reset_kv(crom_model_t *m);
+
+/* Kernels C1_TOPK (format_id = 2 / 3) */
+size_t mat_c1_bytes(int rows, int cols, int k_delta);
+crom_c1_mat_t c1_mat_from(const uint8_t *p, int rows, int cols, int k_delta);
+void c1_matvec(const crom_c1_mat_t *W, const float *x, float *out, int threads);
+void c1_matmul_batch(const crom_c1_mat_t *W, const float *X, int B, int stride_X,
+                     float *Out, int stride_Out, int threads);
 
 /* Getters para Go/C */
 int crom_vocab_size(const crom_model_t *m);

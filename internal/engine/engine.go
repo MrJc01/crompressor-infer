@@ -2,7 +2,7 @@ package engine
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../engine
-#cgo LDFLAGS: -L${SRCDIR}/../../engine -lcrom_infer -lm -fopenmp -lpthread
+#cgo LDFLAGS: -L${SRCDIR}/../../engine -l:libcrom_infer.a -lm -fopenmp -lpthread
 
 #include "crom_infer.h"
 #include <stdlib.h>
