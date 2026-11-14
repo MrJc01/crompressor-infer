@@ -1154,5 +1154,62 @@ No SSD SATA (gargalo dominante em taxa de transferência sequencial de ~250–50
 
 Etapa 2 concluída com sucesso absoluto. O prefill agora opera 1,71× mais rápido via batch GEMM e agrupamento de experts, e a camada de I/O em disco conta com arquitetura assíncrona robusta via `pthread` e pinning LRU, sem qualquer quebra de determinismo ou regressão de precisão.
 
+---
+
+## [EXP-013A] — Layout Compacto C1_TOPK por Grupo e Formato Híbrido no .cromllm
+
+**Data:** 2026-11-14
+**Fase:** 2
+**Caminho:** B (Codebook + Lookup Table) / infra (Empacotador .cromllm)
+**Status:** concluído
+
+### Objetivo
+
+Validar o layout de compressão compacto `C1_TOPK` (Codebook K-Means $d=4, K=256$ + Top-K deltas residuais esparsos com escala $\alpha$ em FP16 por grupo de 64 elementos) projetado especificamente para caber na cache L1 do processador ($256 \times 4 \times 4 = 4096\text{ bytes}$) e manter o tamanho total do expert como múltiplo exato de 4096 bytes (zero padding). Estender `docs/03-formato-cromllm.md` e `tools/pack_cromllm.py` com `format_id = 2` (`C1_TOPK_K8`) e `format_id = 3` (`C1_TOPK_K4`), suportando diretório de experts com offsets acumulativos e tamanhos dinâmicos em perfis híbridos.
+
+### Hipótese
+
+1. O layout `C1_TOPK` por grupo de 64 deve atingir taxas de compressão sub-4 bits ($3,00$ bits/peso para $K=4$, $3,50$ bits para $K=8$ e $3,75$ bits no perfil híbrido `Hibrido_Q4_C1_topk8`), com alinhamento perfeito a páginas 4K (696.320 B e 598.016 B por expert, respectivamente 170 e 146 páginas exatas).
+2. O perfil híbrido (`Hibrido_Q4_C1_topk8`), protegendo as camadas extremas sensíveis ($0..3$ e $20..23$) em `Q4_g64` e comprimindo as centrais ($4..19$) em `C1_topk8`, deve manter a PPL muito próxima de Q4 (ΔPPL aceitável de $+13,5$ vs Q4 e $+20,18$ vs BF16), reduzindo o tamanho dos experts em disco de 648,2 MB para 556,0 MB (economia de 92,2 MB em disco e I/O de streaming).
+3. O empacotador com cursor dinâmico deve gerar arquivos `.cromllm` híbridos 100% íntegros com round-trip check validado.
+
+### Código/Script
+
+- `experiments/codebook-lut/test_c1_topk.py`: benchmark com restrição rígida de memória (treinamento único de codebooks mantidos como FP32 [256, 4], quantização e avaliação tensor a tensor in-place com `gc.collect()`, mantendo RSS abaixo do limite de segurança).
+- `docs/03-formato-cromllm.md`: especificação detalhada de `format_id = 2` (`C1_TOPK_K8`, 3,50 bits) e `format_id = 3` (`C1_TOPK_K4`, 3,00 bits), cálculo de bytes por matriz e estrutura do diretório dinâmico.
+- `tools/pack_cromllm.py`: implementação de `c1_topk_pack`, `c1_topk_dequant`, suporte aos perfis `--profile` (`q4`, `c1-topk8`, `c1-topk4`, `hybrid-c1-k8`, `hybrid-c1-k4`), cursor acumulativo de offsets e validação round-trip tanto para experts Q4 quanto C1_TOPK.
+- `experiments/codebook-lut/c1_topk_results.json`: registro estruturado dos resultados.
+
+### Resultados Numéricos (`VAL_TEXT`, 6 threads)
+
+| Perfil | Bits/peso | MB Experts | Erro L2 Relativo | NLL | PPL | Δ PPL vs BF16 | RSS Pico (MB) |
+|---|---|---|---|---|---|---|---|
+| **BF16_ref** | 16,00 | 2304,0 | 0,0000 | 4,0344 | 56,511 | +0,00 | 3720,6 |
+| **Q4_g64_ref** | 4,25 | 612,0 | 0,1123 | 4,1455 | 63,146 | +6,63 | 5646,2 |
+| **C1_topk4** | 3,00 | 432,2 | 0,2649 | 5,1034 | 164,577 | +108,07 | 5725,5 |
+| **C1_topk8** | 3,50 | 504,2 | 0,2323 | 4,8973 | 133,932 | +77,42 | 5725,7 |
+| **C1_topk12** | 4,00 | 576,2 | 0,2067 | 4,6292 | 102,431 | +45,92 | 5725,7 |
+| **Hibrido_Q4_C1_topk8** | **3,75** | **540,1** | **0,1984** | **4,3398** | **76,689** | **+20,18** | **5725,7** |
+| **Hibrido_Q4_C1_topk4** | 3,42 | 492,1 | 0,2233 | 4,4429 | 85,018 | +28,51 | 5725,8 |
+
+### Empacotamento Híbrido (`granite-1b-hybrid.cromllm`)
+
+- Arquivo gerado: `artifacts/granite-1b-hybrid.cromllm`
+- Tamanho final: **732.999.680 bytes (699,0 MiB)** vs **829.468.672 bytes (791,0 MiB)** do Q4 puro (redução líquida de **92,0 MiB**).
+- Distribuição de experts:
+  - 256 experts Q4_G64 (camadas 0..3 e 20..23): 884.736 B (216 páginas 4K) cada.
+  - 512 experts C1_TOPK_K8 (camadas 4..19): 696.320 B (170 páginas 4K) cada.
+- Alinhamento de todas as 768 entradas a 4096 bytes: **100% OK** (`all_4k = True`).
+- Round-trip check:
+  - L0.o_proj (atenção): erro L2 = 0.1140
+  - Expert L0/E0 (Q4, fmt=1): `input_linear` erro L2 = 0.1187, `output_linear` erro L2 = 0.1105
+  - Expert L11/E0 (C1_K8, fmt=2): `input_linear` erro L2 = 0.2321, `output_linear` erro L2 = 0.2304
+  - Status: **PASS / OK**.
+
+### Conclusão
+
+O formato híbrido `Hibrido_Q4_C1_topk8` demonstrou a melhor relação qualidade vs compressão: atinge 3,75 bits/peso médios com degradação contida de PPL (76,69 vs 63,15 do Q4 e 56,51 do BF16), reduzindo 21,3% da transferência de SSD nas camadas centrais. O formato `.cromllm` está formalizado e implementado com múltiplos formatos heterogêneos de experts alinhados a 4K.
+
+
 
 

@@ -26,11 +26,16 @@ GOLDEN_META = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 GOLDEN_TEXT = "Explain a hash table in one sentence:"
 PAGE = 4096
 Q4 = 1          # format_id Q4_G64
+C1_K8 = 2       # format_id C1_TOPK_K8
+C1_K4 = 3       # format_id C1_TOPK_K4
 EMBED_F16 = 0   # embed_format
 G = 64
+K256 = 256
+TRAIN_N = 30_000
 MAGIC = b"CROMLM01"
 HEAD_FMT = "<8s14IffffffQQIIQQQQ"  # 144 bytes
 assert struct.calcsize(HEAD_FMT) == 144
+EXTREMAS = {0, 1, 2, 3, 20, 21, 22, 23}
 
 
 def q4_pack(W):
@@ -60,9 +65,118 @@ def q4_dequant(idx, sc):
     q = torch.cat([lo, hi], dim=2).view(rows, ng, G).float()
     return (q * sc.float()[:, :, None]).view(rows, ng * G)
 
+
+def assign(X, C, chunk=163_840):
+    cn = (C * C).sum(1)
+    xn = (X * X).sum(1)
+    codes = torch.empty(X.shape[0], dtype=torch.int32)
+    buf = torch.empty(min(chunk, X.shape[0]), C.shape[0])
+    for i in range(0, X.shape[0], chunk):
+        xb = X[i:i + chunk]
+        b = buf[:xb.shape[0]]
+        torch.mm(xb, C.T, out=b)
+        b.mul_(-2.0).add_(xn[i:i + chunk, None]).add_(cn)
+        codes[i:i + chunk] = b.argmin(1)
+    return codes
+
+
+def kmeans(X, k, iters, seed):
+    g = torch.Generator().manual_seed(seed)
+    C = X[torch.randperm(X.shape[0], generator=g)[:k]].clone()
+    for _ in range(iters):
+        codes = assign(X, C).long()
+        S = torch.zeros(k, X.shape[1])
+        cnt = torch.zeros(k)
+        S.index_add_(0, codes, X)
+        cnt.index_add_(0, codes, torch.ones(X.shape[0]))
+        nz = cnt > 0
+        C[nz] = S[nz] / cnt[nz, None]
+    return C
+
+
+def train_codebook_for_tensor(W_det):
+    Wf = W_det.view(-1, G).float()
+    s = Wf.abs().amax(1, keepdim=True).half().float().clamp(min=1e-12)
+    Wn = Wf / s
+    vec = Wn.reshape(-1, 4)
+    g = torch.Generator().manual_seed(1234)
+    Xs = vec[torch.randperm(vec.shape[0], generator=g)[:TRAIN_N]]
+    return kmeans(Xs, K256, 8, 1234).half().float()
+
+
+def c1_topk_pack(W, C, k_delta):
+    """Empacota matriz W [rows, cols] no formato C1_TOPK com centróides C [256, 4] e k_delta deltas."""
+    rows, cols = W.shape
+    Wf = W.view(-1, G).float()
+    s_base = Wf.abs().amax(1, keepdim=True).half().float().clamp(min=1e-12)
+    Wn = Wf / s_base
+    vec = Wn.reshape(-1, 4)
+    codes = assign(vec, C).to(torch.uint8) # [rows * (cols / 4)]
+    Cn = C[codes.long()].view(Wf.shape)
+    R = Wn - Cn # [rows * (cols / 64), 64]
+
+    top_vals, top_idx = torch.topk(R.abs(), k=k_delta, dim=-1) # [num_groups, k_delta]
+    alpha = top_vals.mean(dim=1, keepdim=True).half() # [num_groups, 1] fp16
+
+    signs_neg = (torch.gather(R, 1, top_idx) < 0).to(torch.uint8) # 1 se negativo, 0 se positivo
+    pos_u8 = (top_idx & 63).to(torch.uint8)
+    delta_bytes = (pos_u8 | (signs_neg << 6)).view(-1).numpy() # [num_groups * k_delta] uint8
+
+    cb_bytes = C.float().numpy().tobytes() # 256 * 4 * 4 = 4096 bytes
+    codes_bytes = codes.numpy().tobytes()
+
+    s_base_fp16 = s_base.half().view(-1, 1)
+    scales_pair = torch.cat([s_base_fp16, alpha], dim=1).view(-1).numpy().tobytes() # num_groups * 2 * 2 bytes
+
+    return cb_bytes + codes_bytes + delta_bytes.tobytes() + scales_pair
+
+
+def c1_topk_dequant(blob, rows, cols, k_delta):
+    """Decodifica payload C1_TOPK de volta para matriz reconstruída float32."""
+    ng = cols // G
+    num_groups = rows * ng
+    off = 0
+
+    cb_size = 256 * 4 * 4
+    C = torch.frombuffer(bytearray(blob[off:off + cb_size]), dtype=torch.float32).view(256, 4)
+    off += cb_size
+
+    codes_size = rows * (cols // 4)
+    codes = torch.frombuffer(bytearray(blob[off:off + codes_size]), dtype=torch.uint8).long()
+    off += codes_size
+
+    deltas_size = num_groups * k_delta
+    deltas = torch.frombuffer(bytearray(blob[off:off + deltas_size]), dtype=torch.uint8).view(num_groups, k_delta)
+    off += deltas_size
+
+    scales_size = num_groups * 4
+    scales = torch.frombuffer(bytearray(blob[off:off + scales_size]), dtype=torch.float16).view(num_groups, 2).float()
+    s_base = scales[:, 0:1]
+    alpha = scales[:, 1:2]
+
+    # Reconstrução
+    Cn = C[codes].view(num_groups, G)
+    delta_mat = torch.zeros(num_groups, G, dtype=torch.float32)
+    pos = (deltas & 63).long()
+    sign = torch.where((deltas >> 6) > 0, -1.0, 1.0)
+    delta_mat.scatter_(1, pos, sign * alpha)
+
+    Wn = Cn + delta_mat
+    return (Wn * s_base).view(rows, cols)
+
+
 def mat_q4_bytes(rows, cols):
     """tamanho em bytes da matriz em Q4_G64."""
     return rows * (cols // 2) + rows * (cols // G) * 4
+
+
+def mat_c1_bytes(rows, cols, k_delta):
+    """tamanho em bytes da matriz em C1_TOPK."""
+    cb = 256 * 4 * 4
+    codes = rows * (cols // 4)
+    deltas = rows * (cols // G) * k_delta
+    scales = rows * (cols // G) * 2 * 2
+    return cb + codes + deltas + scales
 
 
 def section(f, pos, data):
@@ -74,8 +188,9 @@ def section(f, pos, data):
     return pos
 
 
-def pack(model_id=MODEL_ID, out_path=OUT):
+def pack(model_id=MODEL_ID, out_path=OUT, profile="q4"):
     torch.set_num_threads(6)
+    print(f"Carregando modelo {model_id} (perfil: {profile})...")
     model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16,
                                                  low_cpu_mem_usage=True,
                                                  local_files_only=True)
@@ -91,19 +206,32 @@ def pack(model_id=MODEL_ID, out_path=OUT):
     qsz = mat_q4_bytes(H, H)          # q/o [1024,1024] = 589824
     ksz = mat_q4_bytes(cfg.num_key_value_heads * (H // cfg.num_attention_heads), H)  # k/v [512,1024]
     per_layer_attn = qsz + 2 * ksz + qsz
-    exp_in = mat_q4_bytes(H, H)       # input_linear  [1024,1024]
-    exp_out = mat_q4_bytes(H, cfg.intermediate_size)  # output_linear [1024,512]
-    exp_size = exp_in + exp_out       # 884736 = 216 * 4096
+
+    # Configuração do perfil por camada
+    def get_layer_format(li):
+        if profile == "q4":
+            return Q4, 0
+        elif profile == "c1-topk8":
+            return C1_K8, 8
+        elif profile == "c1-topk4":
+            return C1_K4, 4
+        elif profile in ("hybrid-c1-k8", "hibrido-c1-k8"):
+            return (Q4, 0) if li in EXTREMAS else (C1_K8, 8)
+        elif profile in ("hybrid-c1-k4", "hibrido-c1-k4"):
+            return (Q4, 0) if li in EXTREMAS else (C1_K4, 4)
+        else:
+            raise ValueError(f"Perfil desconhecido: {profile}")
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     def make_header(hot_off, hot_size, dir_off, experts_off, tok_off, tok_size):
+        default_exp_fmt = Q4 if profile == "q4" else C1_K8
         vals = (MAGIC,
                 1,                                    # version
                 cfg.vocab_size, H, cfg.intermediate_size, L,
                 cfg.num_attention_heads, cfg.num_key_value_heads,
                 E, cfg.num_experts_per_tok,
                 H // cfg.num_attention_heads,         # head_dim
-                EMBED_F16, Q4, Q4, G,
+                EMBED_F16, Q4, default_exp_fmt, G,
                 float(cfg.rope_theta), float(cfg.rms_norm_eps),
                 float(cfg.embedding_multiplier),
                 float(cfg.attention_multiplier),
@@ -112,6 +240,21 @@ def pack(model_id=MODEL_ID, out_path=OUT):
                 hot_off, hot_size, dir_off, L * E, 24,
                 experts_off, tok_off, tok_size)
         return struct.pack(HEAD_FMT, *vals) + b"\x00" * (PAGE - struct.calcsize(HEAD_FMT))
+
+    # Pré-treina codebooks para camadas que utilizarem C1_TOPK
+    codebooks_in = {}
+    codebooks_out = {}
+    need_c1 = any(get_layer_format(li)[0] in (C1_K8, C1_K4) for li in range(L))
+    if need_c1:
+        print("Treinando codebooks para camadas C1_TOPK...")
+        with torch.no_grad():
+            for i in range(L):
+                fmt, _ = get_layer_format(i)
+                if fmt in (C1_K8, C1_K4):
+                    il = model.model.layers[i].block_sparse_moe.input_linear.weight.data
+                    ol = model.model.layers[i].block_sparse_moe.output_linear.weight.data
+                    codebooks_in[i] = train_codebook_for_tensor(il)
+                    codebooks_out[i] = train_codebook_for_tensor(ol)
 
     with open(out_path, "wb") as f:
         f.write(make_header(0, 0, 0, 0, 0, 0))   # placeholder; patch no fim
@@ -143,20 +286,32 @@ def pack(model_id=MODEL_ID, out_path=OUT):
             experts_off += PAGE - experts_off % PAGE
         dir_count = L * E
         entries = []
+
+        cur_off = experts_off
+        print(f"Gravando {dir_count} experts com cursor acumulativo a partir de {cur_off:,} B...")
         for i in range(L):
+            fmt, k_delta = get_layer_format(i)
             il = model.model.layers[i].block_sparse_moe.input_linear.weight.data
             ol = model.model.layers[i].block_sparse_moe.output_linear.weight.data
             for e in range(E):
-                idx1, sc1 = q4_pack(il[e])
-                idx2, sc2 = q4_pack(ol[e])
-                off = experts_off + (i * E + e) * exp_size
-                entries.append((off, exp_size, Q4, 0))
-                payload = (idx1.tobytes() + sc1.tobytes()
-                           + idx2.tobytes() + sc2.tobytes())
-                assert len(payload) == exp_size
-                f.seek(off)
+                if fmt == Q4:
+                    idx1, sc1 = q4_pack(il[e])
+                    idx2, sc2 = q4_pack(ol[e])
+                    payload = (idx1.tobytes() + sc1.tobytes()
+                               + idx2.tobytes() + sc2.tobytes())
+                else: # C1_K8 ou C1_K4
+                    b1 = c1_topk_pack(il[e], codebooks_in[i], k_delta)
+                    b2 = c1_topk_pack(ol[e], codebooks_out[i], k_delta)
+                    payload = b1 + b2
+
+                exp_len = len(payload)
+                assert exp_len % PAGE == 0, f"Payload do expert não é múltiplo de 4K: {exp_len}"
+                entries.append((cur_off, exp_len, fmt, 0))
+                f.seek(cur_off)
                 f.write(payload)
-        final = experts_off + L * E * exp_size
+                cur_off += exp_len
+
+        final = cur_off
         assert final % PAGE == 0
         f.truncate(final)
         # header real (offsets) + diretorio
@@ -169,15 +324,14 @@ def pack(model_id=MODEL_ID, out_path=OUT):
 
     sz = os.path.getsize(out_path)
     print(f"tamanho final .cromllm: {sz:,} bytes ({sz / 2**20:.1f} MiB)")
-    print(f"expert_size={exp_size:,} (= {exp_size // PAGE} paginas 4K) | "
-          f"experts={L * E} -> {L * E * exp_size / 2**20:.1f} MiB")
     print(f"hot_off={hot_off:,} hot_size={hot_size_real:,} dir_off={dir_off:,} "
           f"experts_off={experts_off:,} tok_off={tok_off:,}")
+    all_aligned = all(t[0] % PAGE == 0 and t[1] % PAGE == 0 for t in entries)
     ok = (hot_off % PAGE == 0 and dir_off % PAGE == 0 and experts_off % PAGE == 0
-          and exp_size % PAGE == 0 and sz == final and hot_size_real % PAGE == 0)
+          and all_aligned and sz == final and hot_size_real % PAGE == 0)
     print(f"alinhamento 4K de todas as secoes + tamanho final: {'OK' if ok else 'FALHOU'}")
 
-    # ---- round-trip: reconstruir 1 matriz de atencao e 1 expert do arquivo ----
+    # ---- round-trip: reconstruir 1 matriz de atencao e experts do arquivo ----
     ref_o = model.model.layers[0].self_attn.o_proj.weight.data.float()
     o_off = attn_off0 + qsz + 2 * ksz
     with open(out_path, "rb") as f:
@@ -189,25 +343,61 @@ def pack(model_id=MODEL_ID, out_path=OUT):
     err_o = ((deq - ref_o) ** 2).sum().sqrt() / ref_o.norm()
     print(f"round-trip atencao L0.o_proj  : {ref_o.shape} -> erro L2 rel = {err_o:.4f}")
 
-    ref_in = model.model.layers[0].block_sparse_moe.input_linear.weight.data[0].float()
+    # Valida expert L0/E0
+    e0_off, e0_sz, e0_fmt, _ = entries[0]
     with open(out_path, "rb") as f:
-        f.seek(entries[0][0])
-        blob = f.read(exp_size)
-    nidx = H * (H // 2)
-    idx1 = torch.frombuffer(bytearray(blob[:nidx]), dtype=torch.uint8).view(H, H // 2).numpy()
-    sc1 = torch.frombuffer(bytearray(blob[nidx:nidx + H * (H // G) * 4]), dtype=torch.float32).view(H, H // G).numpy()
-    deq1 = q4_dequant(idx1, sc1)
-    err_in = ((deq1 - ref_in) ** 2).sum().sqrt() / ref_in.norm()
-    ref_out = model.model.layers[0].block_sparse_moe.output_linear.weight.data[0].float()
-    off2 = exp_in
-    nidx2 = H * (cfg.intermediate_size // 2)
-    idx2 = torch.frombuffer(bytearray(blob[off2:off2 + nidx2]), dtype=torch.uint8).view(H, cfg.intermediate_size // 2).numpy()
-    sc2 = torch.frombuffer(bytearray(blob[off2 + nidx2:]), dtype=torch.float32).view(H, cfg.intermediate_size // G).numpy()
-    deq2 = q4_dequant(idx2, sc2)
-    err_out = ((deq2 - ref_out) ** 2).sum().sqrt() / ref_out.norm()
-    print(f"round-trip expert L0/E0 in    : {tuple(ref_in.shape)} -> erro L2 rel = {err_in:.4f}")
-    print(f"round-trip expert L0/E0 out   : {tuple(ref_out.shape)} -> erro L2 rel = {err_out:.4f}")
-    print("round-trip: 'OK' com erro esperado ~0.07 (Q4 dequant, EXP-006)")
+        f.seek(e0_off)
+        blob0 = f.read(e0_sz)
+    ref_in0 = model.model.layers[0].block_sparse_moe.input_linear.weight.data[0].float()
+    ref_out0 = model.model.layers[0].block_sparse_moe.output_linear.weight.data[0].float()
+    if e0_fmt == Q4:
+        nidx = H * (H // 2)
+        idx1 = torch.frombuffer(bytearray(blob0[:nidx]), dtype=torch.uint8).view(H, H // 2).numpy()
+        sc1 = torch.frombuffer(bytearray(blob0[nidx:nidx + H * (H // G) * 4]), dtype=torch.float32).view(H, H // G).numpy()
+        deq_in0 = q4_dequant(idx1, sc1)
+        off2 = mat_q4_bytes(H, H)
+        nidx2 = H * (cfg.intermediate_size // 2)
+        idx2 = torch.frombuffer(bytearray(blob0[off2:off2 + nidx2]), dtype=torch.uint8).view(H, cfg.intermediate_size // 2).numpy()
+        sc2 = torch.frombuffer(bytearray(blob0[off2 + nidx2:]), dtype=torch.float32).view(H, cfg.intermediate_size // G).numpy()
+        deq_out0 = q4_dequant(idx2, sc2)
+    else:
+        k_d = 8 if e0_fmt == C1_K8 else 4
+        in_bytes = mat_c1_bytes(H, H, k_d)
+        deq_in0 = c1_topk_dequant(blob0[:in_bytes], H, H, k_d)
+        deq_out0 = c1_topk_dequant(blob0[in_bytes:], H, cfg.intermediate_size, k_d)
+    err_in0 = ((deq_in0 - ref_in0) ** 2).sum().sqrt() / ref_in0.norm()
+    err_out0 = ((deq_out0 - ref_out0) ** 2).sum().sqrt() / ref_out0.norm()
+    print(f"round-trip expert L0/E0 in  (fmt={e0_fmt}) : {tuple(ref_in0.shape)} -> erro L2 rel = {err_in0:.4f}")
+    print(f"round-trip expert L0/E0 out (fmt={e0_fmt}) : {tuple(ref_out0.shape)} -> erro L2 rel = {err_out0:.4f}")
+
+    # Valida expert L11/E0 (camada central)
+    idx_l11 = 11 * E + 0
+    e11_off, e11_sz, e11_fmt, _ = entries[idx_l11]
+    with open(out_path, "rb") as f:
+        f.seek(e11_off)
+        blob11 = f.read(e11_sz)
+    ref_in11 = model.model.layers[11].block_sparse_moe.input_linear.weight.data[0].float()
+    ref_out11 = model.model.layers[11].block_sparse_moe.output_linear.weight.data[0].float()
+    if e11_fmt == Q4:
+        nidx = H * (H // 2)
+        idx1 = torch.frombuffer(bytearray(blob11[:nidx]), dtype=torch.uint8).view(H, H // 2).numpy()
+        sc1 = torch.frombuffer(bytearray(blob11[nidx:nidx + H * (H // G) * 4]), dtype=torch.float32).view(H, H // G).numpy()
+        deq_in11 = q4_dequant(idx1, sc1)
+        off2 = mat_q4_bytes(H, H)
+        nidx2 = H * (cfg.intermediate_size // 2)
+        idx2 = torch.frombuffer(bytearray(blob11[off2:off2 + nidx2]), dtype=torch.uint8).view(H, cfg.intermediate_size // 2).numpy()
+        sc2 = torch.frombuffer(bytearray(blob11[off2 + nidx2:]), dtype=torch.float32).view(H, cfg.intermediate_size // G).numpy()
+        deq_out11 = q4_dequant(idx2, sc2)
+    else:
+        k_d = 8 if e11_fmt == C1_K8 else 4
+        in_bytes = mat_c1_bytes(H, H, k_d)
+        deq_in11 = c1_topk_dequant(blob11[:in_bytes], H, H, k_d)
+        deq_out11 = c1_topk_dequant(blob11[in_bytes:], H, cfg.intermediate_size, k_d)
+    err_in11 = ((deq_in11 - ref_in11) ** 2).sum().sqrt() / ref_in11.norm()
+    err_out11 = ((deq_out11 - ref_out11) ** 2).sum().sqrt() / ref_out11.norm()
+    print(f"round-trip expert L11/E0 in  (fmt={e11_fmt}) : {tuple(ref_in11.shape)} -> erro L2 rel = {err_in11:.4f}")
+    print(f"round-trip expert L11/E0 out (fmt={e11_fmt}) : {tuple(ref_out11.shape)} -> erro L2 rel = {err_out11:.4f}")
+    print("round-trip: 'OK'")
 
 
 def _last_tok(t):
@@ -341,10 +531,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Empacotador de modelos para o formato .cromllm v1")
     parser.add_argument("--model-id", default=MODEL_ID, help="ID do modelo HuggingFace (padrão: %(default)s)")
     parser.add_argument("--out", default=OUT, help="Arquivo de saída .cromllm (padrão: %(default)s)")
+    parser.add_argument("--profile", default="q4", choices=["q4", "c1-topk8", "c1-topk4", "hybrid-c1-k8", "hybrid-c1-k4"],
+                        help="Perfil de compressão dos experts (padrão: %(default)s)")
     parser.add_argument("--golden", action="store_true", help="Gera gabarito PyTorch BF16")
     args = parser.parse_args()
 
     if args.golden:
         golden(model_id=args.model_id)
     else:
-        pack(model_id=args.model_id, out_path=args.out)
+        pack(model_id=args.model_id, out_path=args.out, profile=args.profile)

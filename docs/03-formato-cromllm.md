@@ -90,19 +90,22 @@ ordenadas por camada e depois por expert (`layer*32 + expert`):
 struct expert_dir_entry {
     uint64_t offset_bytes;  // offset absoluto no .cromllm (múltiplo de 4096)
     uint64_t size_bytes;    // tamanho do payload (múltiplo de 4096)
-    uint32_t format_id;     // 1 = Q4_G64 (permite perfis híbridos por expert)
+    uint32_t format_id;     // 1 = Q4_G64, 2 = C1_TOPK_K8, 3 = C1_TOPK_K4
     uint32_t reserved;
 };
 ```
 
 Cada expert é gravado **contíguo e alinhado a 4 KiB**: payload = `input_linear` +
-`output_linear` da MESMA expert, cabendo em **1 único `pread()`**.
+`output_linear` da MESMA expert, cabendo em **1 único `pread()`**. Em perfis híbridos,
+o diretório armazena o `offset_bytes`, `size_bytes` e `format_id` individuais de cada entrada.
 
-## 6. Payload de expert (Q4_G64)
+## 6. Payload de expert
 
 Para cada expert, em ordem: `input_linear` `[32 experts, 1024 out, 1024 in]` →
 matriz `[1024, 1024]` do expert; depois `output_linear` `[32, 1024 out, 512 in]`
-→ matriz `[1024, 512]` do expert. Ambas em Q4_G64:
+→ matriz `[1024, 512]` do expert.
+
+### 6.1 `format_id = 1` (Q4_G64)
 
 - Grupos de **64 pesos ao longo da dimensão de entrada (cols)**.
 - Vetor `idx` contíguo por matriz: por linha, `cols/2` bytes; byte `c` do grupo
@@ -113,12 +116,42 @@ matriz `[1024, 1024]` do expert; depois `output_linear` `[32, 1024 out, 512 in]`
   (1 escala por grupo de 64).
 - Valores: `q ∈ [-7, 7]` int; reconstrução `w = q * scale`.
 
-**Tamanho exato por expert (granite-1b):**
+**Tamanho exato por expert Q4 (granite-1b):**
 `input_linear` [1024, 1024]: idx 1024×512 = 524 288 B + escalas 1024×16×4 =
 65 536 B → **589 824 B**; `output_linear` [1024, 512]: idx 1024×256 = 262 144 B +
 escalas 1024×8×4 = 32 768 B → **294 912 B**; **total 884 736 B por expert**
 (= 216 × 4096, sem padding extra!). 768 experts × 884 736 B =
 **679 477 248 B (648,2 MB)**.
+
+### 6.2 `format_id = 2` (`C1_TOPK_K8`, 3,50 bits/peso) e `format_id = 3` (`C1_TOPK_K4`, 3,00 bits/peso)
+
+Estrutura compacta baseada em K-Means no domínio normalizado por grupo de 64 com deltas esparsos top-k.
+Cada matriz (`input_linear` [rows, cols], depois `output_linear` [rows, cols]) contém sequencialmente:
+1. `codebook`: `256 * 4` floats FP32 (`4.096 bytes`, exatamente 1 página 4K na L1).
+2. `codes`: `rows * (cols / 4)` bytes `uint8` (cada byte é um índice de centróide 0..255 para 4 pesos consecutivos).
+3. `deltas`: `rows * (cols / 64) * k_delta` bytes `uint8`. Cada byte codifica:
+   `byte = (pos & 63) | ((R[pos] < 0) << 6)`, onde `pos ∈ [0, 63]` é a posição do peso dentro do grupo de 64 e o bit 6 é o sinal do delta (1 se negativo, 0 se positivo).
+4. `scales`: `rows * (cols / 64) * 2` `uint16` (pares contíguos de `fp16`: `[s_base, alpha]` por grupo de 64).
+
+**Reconstrução matemática:**
+- `Wn = codebook[codes[i]]`
+- Para cada um dos `k_delta` deltas do grupo: `Wn[pos] += (sign ? -alpha : +alpha)`
+- `W = Wn * s_base`
+
+**Tamanhos exatos por expert (granite-1b):**
+- **Para `k_delta = 8` (`format_id = 2`):**
+  - `input_linear` [1024, 1024]: 4096 (codebook) + 262 144 (codes) + 131 072 (deltas) + 65 536 (scales) = **462 848 B** (113 páginas 4K)
+  - `output_linear` [1024, 512]: 4096 (codebook) + 131 072 (codes) + 65 536 (deltas) + 32 768 (scales) = **233 472 B** (57 páginas 4K)
+  - **Total por expert:** **696 320 B** (= **170 páginas 4K exatas**, zero padding!). Redução de **21,3%** no payload de disco/I/O vs Q4.
+- **Para `k_delta = 4` (`format_id = 3`):**
+  - `input_linear` [1024, 1024]: 4096 + 262 144 + 65 536 + 65 536 = **397 312 B** (97 páginas 4K)
+  - `output_linear` [1024, 512]: 4096 + 131 072 + 32 768 + 32 768 = **200 704 B** (49 páginas 4K)
+  - **Total por expert:** **598 016 B** (= **146 páginas 4K exatas**, zero padding!). Redução de **32,4%** no payload de disco/I/O vs Q4.
+
+Em um perfil híbrido (ex.: `Hibrido_Q4_C1_topk8` com camadas extremas `0..3, 20..23` em Q4 e centrais `4..19` em C1_topk8):
+- 256 experts Q4 × 884 736 B = 226 492 416 B
+- 512 experts C1_k8 × 696 320 B = 356 515 840 B
+- Seção de experts: 583 008 256 B (**556,0 MB** vs 648,2 MB no Q4 puro, **-92,2 MB de disco/streaming**).
 
 ## 7. Matemática de referência (must-ler do motor — EXP-007)
 
