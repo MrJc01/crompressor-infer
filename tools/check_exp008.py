@@ -72,7 +72,7 @@ def parse_ckpt(text):
     out["gen_tokens"] = [int(x) for x in m.group(2).split()]
     out["n_gen"] = int(m.group(1))
 
-    m = re.search(r"load_ms=([\d.]+)\s+prefill_tok/s=([\d.]+)\s+decode_tok/s=([\d.]+)\s+RSS_MB=([\d.]+)\s+cache_hit%=([\d.]+)\s+preload_MB=([\d.]+)\s+ssd_stream_MB=([\d.]+)\s+ssd_io_ms=([\d.]+)\s+threads=(\d+)\s+cache=(\d+)", text)
+    m = re.search(r"load_ms=([\d.]+)\s+prefill_tok/s=([\d.]+)\s+decode_tok/s=([\d.]+)\s+RSS_MB=([\d.]+)\s+cache_hit%=([\d.]+)\s+preload_MB=([\d.]+)\s+ssd_stream_MB=([\d.]+)\s+ssd_io_ms=([\d.]+)\s+attn_ms=([\d.]+)\s+moe_ms=([\d.]+)\s+lm_head_ms=([\d.]+)\s+threads=(\d+)\s+cache=(\d+)", text)
     out["bench"] = {
         "load_ms": float(m.group(1)),
         "prefill_tok_s": float(m.group(2)),
@@ -82,8 +82,11 @@ def parse_ckpt(text):
         "preload_mb": float(m.group(6)),
         "ssd_stream_mb": float(m.group(7)),
         "ssd_io_ms": float(m.group(8)),
-        "threads": int(m.group(9)),
-        "cache": int(m.group(10)),
+        "attn_ms": float(m.group(9)),
+        "moe_ms": float(m.group(10)),
+        "lm_head_ms": float(m.group(11)),
+        "threads": int(m.group(12)),
+        "cache": int(m.group(13)),
     }
     return out
 
@@ -152,7 +155,7 @@ def main():
               f"match={ck['next_token_id'] == golden['next_token']['id']}")
         ok_all &= top3_match and ck["next_token_id"] == golden["next_token"]["id"]
 
-        print(f"  Bench: load={ck['bench']['load_ms']:.1f}ms prefill={ck['bench']['prefill_tok_s']:.2f} tok/s decode={ck['bench']['decode_tok_s']:.2f} tok/s RSS={ck['bench']['rss_mb']:.1f}MB hit={ck['bench']['cache_hit_pct']:.2f}% preload={ck['bench']['preload_mb']:.2f}MB stream={ck['bench']['ssd_stream_mb']:.2f}MB")
+        print(f"  Bench: load={ck['bench']['load_ms']:.1f}ms prefill={ck['bench']['prefill_tok_s']:.2f} tok/s decode={ck['bench']['decode_tok_s']:.2f} tok/s RSS={ck['bench']['rss_mb']:.1f}MB hit={ck['bench']['cache_hit_pct']:.2f}% preload={ck['bench']['preload_mb']:.2f}MB stream={ck['bench']['ssd_stream_mb']:.2f}MB attn={ck['bench']['attn_ms']:.1f}ms moe={ck['bench']['moe_ms']:.1f}ms lm_head={ck['bench']['lm_head_ms']:.1f}ms")
         results[cache]["ok"] = ok_all
 
     # comparacao dos tokens gerados entre os 3 modos

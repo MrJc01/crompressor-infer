@@ -202,8 +202,9 @@ int main(int argc, char **argv) {
     double decode_tok = (n_gen > 0 && decode_s > 0) ? (double)n_gen / decode_s : 0.0;
 
     long long hits, misses, bytes, stream_bytes;
-    double io_ms;
-    crom_stats(&m, &hits, &misses, &bytes, &stream_bytes, &io_ms);
+    double io_ms, attn_ms, moe_ms, lm_head_ms;
+    crom_stats(&m, &hits, &misses, &bytes, &stream_bytes, &io_ms,
+               &attn_ms, &moe_ms, &lm_head_ms);
     long long total = hits + misses;
     double hit_pct = total > 0 ? 100.0 * (double)hits / (double)total : 100.0;
 
@@ -218,9 +219,11 @@ int main(int argc, char **argv) {
     }
 
     printf("load_ms=%.1f prefill_tok/s=%.2f decode_tok/s=%.2f RSS_MB=%.1f "
-           "cache_hit%%=%.2f preload_MB=%.2f ssd_stream_MB=%.2f ssd_io_ms=%.1f threads=%d cache=%d\n",
+           "cache_hit%%=%.2f preload_MB=%.2f ssd_stream_MB=%.2f ssd_io_ms=%.1f "
+           "attn_ms=%.1f moe_ms=%.1f lm_head_ms=%.1f threads=%d cache=%d\n",
            load_ms, prefill_tok, decode_tok, (double)rss_kb / 1024.0,
-           hit_pct, (double)bytes / (1024.0 * 1024.0), (double)stream_bytes / (1024.0 * 1024.0), io_ms, threads, cache_experts);
+           hit_pct, (double)bytes / (1024.0 * 1024.0), (double)stream_bytes / (1024.0 * 1024.0), io_ms,
+           attn_ms, moe_ms, lm_head_ms, threads, cache_experts);
 
     crom_model_close(&m);
     free(hidden);

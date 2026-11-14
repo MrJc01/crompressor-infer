@@ -53,12 +53,29 @@ static crom_q4_mat_t q4_mat_from(const unsigned char *p, int rows, int cols) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Q4_g64 matvec (escalar por linha, OpenMP nas linhas)               */
+/* Q4_g64 matvec AVX2+FMA (exato do bench_kernels.c kv_q4)           */
 /* Layout: idx u8 [rows, cols/2]; byte c do grupo g =
  *   (q[c]+8) | ((q[c+32]+8)<<4); low nibble = peso g*64+c,
  *   high nibble = peso g*64+c+32. scales f32 [rows, cols/64].
  * w = (q-8)*scale.                                                   */
 /* ------------------------------------------------------------------ */
+
+static inline float hsum256(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
+}
+
+static inline void i8_to_f32_32(__m256i v, __m256 *f) {
+    __m256i a = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(v));
+    __m256i b = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(v, 1));
+    __m256i p[4] = {_mm256_cvtepi16_epi32(_mm256_castsi256_si128(a)),
+                    _mm256_cvtepi16_epi32(_mm256_extracti128_si256(a, 1)),
+                    _mm256_cvtepi16_epi32(_mm256_castsi256_si128(b)),
+                    _mm256_cvtepi16_epi32(_mm256_extracti128_si256(b, 1))};
+    for (int i = 0; i < 4; i++) f[i] = _mm256_cvtepi32_ps(p[i]);
+}
 
 static void q4_matvec(const crom_q4_mat_t *W, const float *x, float *out, int threads) {
     (void)threads;
@@ -68,23 +85,29 @@ static void q4_matvec(const crom_q4_mat_t *W, const float *x, float *out, int th
     const int half = cols / 2;
     const uint8_t *idx = W->idx;
     const float *sc = W->scales;
+    const __m256i maskF = _mm256_set1_epi8(0x0F);
 
 #pragma omp parallel for schedule(static)
     for (int r = 0; r < rows; r++) {
-        float acc = 0.0f;
-        const uint8_t *idx_r = idx + (size_t)r * half;
-        const float *sc_r = sc + (size_t)r * ng;
+        const uint8_t *ip = idx + (size_t)r * half;
+        const float *sp = sc + (size_t)r * ng;
+        __m256 acc = _mm256_setzero_ps();
         for (int g = 0; g < ng; g++) {
-            float s = sc_r[g];
-            for (int c = 0; c < 32; c++) {
-                uint8_t byte = idx_r[g * 32 + c];
-                int qlo = (int)(byte & 0x0F) - 8;
-                int qhi = (int)((byte >> 4) & 0x0F) - 8;
-                acc += x[g * 64 + c] * (float)qlo * s;
-                acc += x[g * 64 + c + 32] * (float)qhi * s;
+            /* carrega 32 bytes do grupo g (idx u8) */
+            __m256i p = _mm256_loadu_si256((const __m256i *)(ip + g * 32));
+            __m256i lo = _mm256_sub_epi8(_mm256_and_si256(p, maskF), _mm256_set1_epi8(8));
+            __m256i hi = _mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(p, 4), maskF), _mm256_set1_epi8(8));
+            __m256 accg = _mm256_setzero_ps();
+            const float *xg = x + g * CROM_GROUP_SIZE;
+            for (int half = 0; half < 2; half++) {
+                __m256 f[4];
+                i8_to_f32_32(half ? hi : lo, f);
+                for (int i = 0; i < 4; i++)
+                    accg = _mm256_fmadd_ps(f[i], _mm256_loadu_ps(xg + half * 32 + i * 8), accg);
             }
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(sp[g]), accg, acc);
         }
-        out[r] = acc;
+        out[r] = hsum256(acc);
     }
 }
 
@@ -423,6 +446,10 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
     m->moe_acc_buf = aligned_alloc(CROM_PAGE, wb * sizeof(float));
     if (!m->moe_acc_buf) { perror("aligned_alloc moe_acc"); return -1; }
 
+    m->attn_ms = 0.0;
+    m->moe_ms = 0.0;
+    m->lm_head_ms = 0.0;
+
     return 0;
 }
 
@@ -436,6 +463,7 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
 
 int crom_layer_attn_resid(crom_model_t *m, int li, const float *hidden_in,
                           int pos, float *hidden_out) {
+    double t0 = now_ms();
     int H = CROM_HIDDEN_SIZE;
     float *work1 = m->work1;
     float *work2 = work1 + H;
@@ -496,6 +524,8 @@ int crom_layer_attn_resid(crom_model_t *m, int li, const float *hidden_in,
 
     for (int i = 0; i < H; i++)
         hidden_out[i] = hidden_in[i] + work1[i] * m->residual_multiplier;
+    
+    m->attn_ms += now_ms() - t0;
     return 0;
 }
 
@@ -504,8 +534,9 @@ int crom_layer_attn_resid(crom_model_t *m, int li, const float *hidden_in,
 /* ------------------------------------------------------------------ */
 
 int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
-                         int pos, float *hidden_out,
-                         int *top8_out, float *top8_w_out) {
+                          int pos, float *hidden_out,
+                          int *top8_out, float *top8_w_out) {
+    double t0 = now_ms();
     (void)pos;
     int H = CROM_HIDDEN_SIZE;
     int I = CROM_INTER_SIZE;
@@ -582,6 +613,8 @@ int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
 
     for (int i = 0; i < H; i++)
         hidden_out[i] = hidden_in[i] + moe_acc[i] * m->residual_multiplier;
+    
+    m->moe_ms += now_ms() - t0;
     return 0;
 }
 
@@ -627,26 +660,26 @@ crom_embed(m, input_ids[position], hidden);
     float *final_norm_w = m->norms_f32 + (size_t)(m->num_layers * 2) * H;
     crom_rms_norm(final_norm_w, hidden, H, m->rms_norm_eps, work1);
 
-    /* lm_head tied (F16C: _mm256_cvtph_ps — carrega 8 uint16_t, converte 8 floats) */
+    /* lm_head tied (F16C + FMA vector accumulator — hsum256 uma vez por linha) */
+    double t0 = now_ms();
     int vocab = CROM_VOCAB_SIZE;
     const uint16_t *embed = m->embed_f16;
 #pragma omp parallel for schedule(static)
     for (int v = 0; v < vocab; v++) {
-        float s = 0.0f;
+        __m256 vacc = _mm256_setzero_ps();
         const uint16_t *ev = embed + (size_t)v * H;
         const float *h = work1;
         int i = 0;
         for (; i + 7 < H; i += 8) {
             __m128i f16 = _mm_loadu_si128((const __m128i *)(ev + i));
             __m256 e = _mm256_cvtph_ps(f16);
-            __m256 hh = _mm256_loadu_ps(h + i);
-            __m256 p = _mm256_mul_ps(e, hh);
-            const float *pf = (const float *)&p;
-            s += pf[0] + pf[1] + pf[2] + pf[3] + pf[4] + pf[5] + pf[6] + pf[7];
+            vacc = _mm256_fmadd_ps(e, _mm256_loadu_ps(h + i), vacc);
         }
+        float s = hsum256(vacc);
         for (; i < H; i++) s += _cvtsh_ss(ev[i]) * h[i];
         out_logits[v] = s / m->logits_scaling;
     }
+    m->lm_head_ms += now_ms() - t0;
     return 0;
 }
 
@@ -655,12 +688,16 @@ crom_embed(m, input_ids[position], hidden);
 /* ------------------------------------------------------------------ */
 
 void crom_stats(const crom_model_t *m, long long *hits, long long *misses,
-                long long *bytes, long long *stream_bytes, double *io_ms) {
+                long long *bytes, long long *stream_bytes, double *io_ms,
+                double *attn_ms, double *moe_ms, double *lm_head_ms) {
     if (hits) *hits = m->cache_hits;
     if (misses) *misses = m->cache_misses;
     if (bytes) *bytes = m->ssd_bytes_read;
     if (stream_bytes) *stream_bytes = m->ssd_stream_bytes_read;
     if (io_ms) *io_ms = m->ssd_io_ms;
+    if (attn_ms) *attn_ms = m->attn_ms;
+    if (moe_ms) *moe_ms = m->moe_ms;
+    if (lm_head_ms) *lm_head_ms = m->lm_head_ms;
 }
 
 void crom_model_close(crom_model_t *m) {

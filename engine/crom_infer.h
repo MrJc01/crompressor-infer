@@ -110,6 +110,9 @@ typedef struct {
     long long ssd_bytes_read;
     long long ssd_stream_bytes_read;  /* apenas leitura runtime (streaming) */
     double ssd_io_ms;
+    double attn_ms;
+    double moe_ms;
+    double lm_head_ms;
 } crom_model_t;
 
 typedef struct {
@@ -132,6 +135,7 @@ int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
                          int *top8_out, float *top8_w_out);
 void crom_rms_norm(const float *w, const float *x, int n, float eps, float *out);
 void crom_stats(const crom_model_t *m, long long *hits, long long *misses,
-                long long *bytes, long long *stream_bytes, double *io_ms);
+                long long *bytes, long long *stream_bytes, double *io_ms,
+                double *attn_ms, double *moe_ms, double *lm_head_ms);
 
 #endif /* CROM_INFER_H */

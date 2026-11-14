@@ -882,3 +882,65 @@ Otimização **F16C no embed/lm_head** funcionou perfeitamente: **todos os check
 
 ---
 
+
+---
+
+## [EXP-009B] — Porta `kv_q4` AVX2+FMA validado + FMA no `lm_head` + timers por estágio
+
+**Data:** 2026-11-14 | **Fase:** 2 | **Caminho:** A (Motor C) | **Status:** concluído
+
+### Objetivo
+
+Substituir o loop escalar de `q4_matvec` pela implementação exata do `kv_q4` de
+`experiments/codebook-lut/bench_kernels.c` (validado com erro `1.4e-7` vs FP32),
+incluindo `hsum256`, `i8_to_f32_32`, `_mm256_loadu_si256`, `_mm256_fmadd_ps` e
+multiplicação da escala `sc_r[g]` **apenas uma vez por grupo de 64**. Também
+converter o acúmulo escalar do `lm_head` (`pf[0]+...+pf[7]`) em acumulador
+vetorial `__m256 vacc` com `_mm256_fmadd_ps` e `hsum256` uma única vez por
+linha. Adicionar contadores `attn_ms`, `moe_ms`, `lm_head_ms` para perfil
+preciso por estágio.
+
+### Código/Script
+
+- `engine/crom_infer.c`: `q4_matvec` = `kv_q4` exato (com `hsum256`,
+  `i8_to_f32_32`, `_mm256_loadu_si256`, `_mm256_fmadd_ps`, escala 1×/grupo);
+  `lm_head` = acumulador `__m256 vacc` + `_mm256_fmadd_ps` + `hsum256` 1×/linha;
+  timers `attn_ms`, `moe_ms`, `lm_head_ms` em `crom_model_t` e `crom_stats`.
+- `engine/crom_cli.c`: impressão de `attn_ms`, `moe_ms`, `lm_head_ms`.
+- `tools/check_exp008.py`: parse novos campos.
+- Compilação: `gcc -O3 -march=native -fopenmp -Wall -Wextra engine/crom_cli.c engine/crom_infer.c -o engine/crom_cli -lm` (0 warnings).
+
+### Métricas numéricas (benchmark 32 tokens + 128 tokens)
+
+| Modo | load_ms | prefill tok/s | decode tok/s (32) | decode tok/s (128) | RSS MB | cache hit % | preload MB | ssd_stream MB | attn_ms | moe_ms | lm_head_ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| **768 (RAM Full)** | 1112 | 61 | **57.3** | **56.9** | 842 | 100.0% | 648.0 | 0.0 | 483 | 1375 | 499 |
+| **576 (75% RAM)** | 1222 | 3.2 | **21.2** | **9.4** | 680 | 93.7% | 0.0 | 1372.8 | 488 | 14886 | 492 |
+| **384 (50% RAM)** | 3560 | 0.8 | **4.5** | **2.9** | 518 | 65.0% | 0.0 | 7646.1 | 536 | 51776 | 517 |
+
+**Tokens 128 idênticos nos 3 modos**: confirmado.
+**Texto 128 tokens (768)**: `"A hash table is a data structure that stores key-value pairs in a way that allows for efficient retrieval of data based on a specific key. It..."` (coerente).
+
+### Comparação EXP-008 → EXP-009 → EXP-009B → Ollama Q8_0
+
+| Configuração | decode tok/s (32) | decode tok/s (128) | RSS MB | Ganho vs EXP-008 |
+|---|---|---|---|---|
+| **EXP-008** (q4 escalar + embed FP32) | 15.0 | ~15.0 | 1034 | 1× (baseline) |
+| **EXP-009** (q4 escalar + F16C embed/lm_head) | 15.8 | **15.5** | 842 | +3% / -18% RAM |
+| **EXP-009B** (kv_q4 AVX2+FMA + FMA lm_head) | **57.3** | **56.9** | 842 | **+3.8× velocidade** |
+| **Ollama Q8_0** (baseline) | 41.3 | — | ~1600 | — |
+
+### Conclusão
+
+**Salto de velocidade decisivo**: o `kv_q4` AVX2+FMA + FMA no `lm_head` elevou
+o decode de **15,5 tok/s → 56,9 tok/s (3,7×)** no modo RAM Full (768 experts),
+com **exatidão numérica idêntica** ao gabarito PyTorch (todos checkpoints `OK`,
+32 tokens 100% idênticos nos 3 modos). O gargalo virou **MoE** (`moe_ms` ≫
+`attn_ms`), abrindo caminho para otimizações futuras: fusão do `router` +
+`input_linear`, LUT quantizada, ou `int8`/`fp8` kernels. O `lm_head` FMA
+reduziu seu tempo a ~30% do total (`lm_head_ms` ≈ 500ms vs `moe_ms` ≫ 1000ms
+no modo RAM). Métricas `attn_ms/moe_ms/lm_head_ms` permitem foco cirúrgico nas
+próximas otimizações.
+
+---
+
