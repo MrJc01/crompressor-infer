@@ -25,6 +25,7 @@ type Config struct {
 	RepeatPenalty float64
 	RepeatWindow  int
 	Stream        bool
+	SyncIO        bool
 	JSONOutput    bool
 	TokenizeOnly  bool
 }
@@ -41,6 +42,7 @@ func main() {
 	flag.Float64Var(&cfg.RepeatPenalty, "repeat-penalty", 1.10, "Repetition penalty factor (1.0 = disabled)")
 	flag.IntVar(&cfg.RepeatWindow, "repeat-window", 64, "Repetition penalty window size")
 	flag.BoolVar(&cfg.Stream, "stream", false, "Stream output in real-time")
+	flag.BoolVar(&cfg.SyncIO, "sync-io", false, "Force synchronous SSD I/O instead of async pthread prefetch")
 	flag.BoolVar(&cfg.JSONOutput, "json", false, "Output JSON with metrics")
 	flag.BoolVar(&cfg.TokenizeOnly, "tokenize-only", false, "Only tokenize the prompt and print JSON ids")
 	flag.Parse()
@@ -79,6 +81,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer model.Close()
+	model.SetSyncIO(cfg.SyncIO)
 	loadMs := time.Since(startLoad).Seconds() * 1000
 
 	// Get tokenizer
@@ -115,10 +118,14 @@ func main() {
 	generated := make([]int, 0, cfg.MaxTokens)
 	promptLen := len(inputIDs)
 
-	// Prefill: run each prompt token once through the KV cache.
+	// Prefill: run prompt tokens through the model to build the KV cache.
 	prefillStart := time.Now()
-	for i := 0; i < len(inputIDs)-1; i++ {
-		model.Forward(inputIDs, i, hidden, logits)
+	if promptLen > 1 {
+		// Batch prefill processes promptLen-1 tokens and computes logits only for the last prompt token
+		if err := model.ForwardBatch(inputIDs[:promptLen-1], 0, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "ForwardBatch failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	prefillMs := time.Since(prefillStart).Seconds() * 1000
 

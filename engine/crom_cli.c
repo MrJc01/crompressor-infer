@@ -57,6 +57,7 @@ int main(int argc, char **argv) {
     int threads = 6;
     int cache_experts = -1;
     int dump_ckpt = 0;
+    int sync_io = 0;
     const char *ids_str = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -67,6 +68,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--cache-experts") && i + 1 < argc) cache_experts = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) max_seq = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-ckpt")) dump_ckpt = 1;
+        else if (!strcmp(argv[i], "--sync-io")) sync_io = 1;
         else { fprintf(stderr, "arg desconhecido: %s\n", argv[i]); return 2; }
     }
     if (!ids_str) { fprintf(stderr, "use --ids\n"); return 2; }
@@ -83,6 +85,7 @@ int main(int argc, char **argv) {
     if (crom_model_open_ctx(model_path, &m, cache_experts, threads, max_seq) != 0) {
         fprintf(stderr, "falha ao abrir modelo\n"); free(ids); return 1;
     }
+    crom_set_sync_io(&m, sync_io);
     double t1 = omp_get_wtime();
     double load_ms = (t1 - t0) * 1000.0;
 
@@ -104,8 +107,14 @@ int main(int argc, char **argv) {
 
     int n_gen = 0;
     double prefill_t0 = omp_get_wtime();
-    for (int p = 0; p < n_ids - 1; p++) {
-        crom_forward(&m, cur, ncur, p, hidden, logits);
+    if (dump_ckpt) {
+        for (int p = 0; p < n_ids - 1; p++) {
+            crom_forward(&m, cur, ncur, p, hidden, logits);
+        }
+    } else {
+        if (n_ids - 1 > 0) {
+            crom_forward_batch(&m, cur, n_ids - 1, 0, logits);
+        }
     }
     double prefill_t1 = omp_get_wtime();
 

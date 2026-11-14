@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <omp.h>
 #include <immintrin.h>
+#include <pthread.h>
 
 #include "crom_infer.h"
 
@@ -111,6 +112,61 @@ static void q4_matvec(const crom_q4_mat_t *W, const float *x, float *out, int th
     }
 }
 
+/* Q4 batch matmul: Out [B, rows] = X [B, cols] * W^T [cols, rows]
+ * X tem stride_X floats por linha; Out tem stride_Out floats por linha.
+ * Para cada linha r de W e grupo g de 64 pesos:
+ * Carrega e descompacta os 64 pesos uma única vez em 8 registradores AVX2 (__m256 f[8]),
+ * multiplica pelos B vetores de X (acumulando acc[b] com FMA),
+ * amortizando a descompactação Q4 e saturação de largura de banda por B.
+ */
+static void q4_matmul_batch(const crom_q4_mat_t *W, const float *X, int B, int stride_X,
+                            float *Out, int stride_Out, int threads) {
+    (void)threads;
+    const int rows = W->rows;
+    const int cols = W->cols;
+    const int ng = cols / CROM_GROUP_SIZE;
+    const int half = cols / 2;
+    const uint8_t *idx = W->idx;
+    const float *sc = W->scales;
+    const __m256i maskF = _mm256_set1_epi8(0x0F);
+
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; r++) {
+        const uint8_t *ip = idx + (size_t)r * half;
+        const float *sp = sc + (size_t)r * ng;
+
+        /* Aloca acumuladores locais para os B tokens */
+        __m256 acc[B];
+        for (int b = 0; b < B; b++) acc[b] = _mm256_setzero_ps();
+
+        for (int g = 0; g < ng; g++) {
+            __m256i p = _mm256_loadu_si256((const __m256i *)(ip + g * 32));
+            __m256i lo = _mm256_sub_epi8(_mm256_and_si256(p, maskF), _mm256_set1_epi8(8));
+            __m256i hi = _mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(p, 4), maskF), _mm256_set1_epi8(8));
+
+            __m256 f[8];
+            i8_to_f32_32(lo, &f[0]);
+            i8_to_f32_32(hi, &f[4]);
+
+            __m256 scale_v = _mm256_set1_ps(sp[g]);
+            for (int i = 0; i < 8; i++) {
+                f[i] = _mm256_mul_ps(f[i], scale_v);
+            }
+
+            for (int b = 0; b < B; b++) {
+                const float *xg = X + (size_t)b * stride_X + g * CROM_GROUP_SIZE;
+                for (int i = 0; i < 8; i++) {
+                    acc[b] = _mm256_fmadd_ps(f[i], _mm256_loadu_ps(xg + i * 8), acc[b]);
+                }
+            }
+        }
+
+        for (int b = 0; b < B; b++) {
+            Out[(size_t)b * stride_Out + r] = hsum256(acc[b]);
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* RMSNorm FP32 (exportado)                                           */
 /* ------------------------------------------------------------------ */
@@ -154,6 +210,7 @@ struct lru_t {
     int *slot_of_expert;
     int *lru_order;
     int *pos_in_lru;
+    int *pinned;       /* [cap] 1 se slot está pinado contra eviction */
 };
 
 static struct lru_t *lru_create(int cap, int total_experts) {
@@ -167,10 +224,12 @@ static struct lru_t *lru_create(int cap, int total_experts) {
     for (int i = 0; i < total_experts; i++) l->slot_of_expert[i] = -1;
     l->lru_order = calloc((size_t)cap, sizeof(int));
     l->pos_in_lru = calloc((size_t)cap, sizeof(int));
-    if (!l->lru_order || !l->pos_in_lru) {
+    l->pinned = calloc((size_t)cap, sizeof(int));
+    if (!l->lru_order || !l->pos_in_lru || !l->pinned) {
         free(l->slot_of_expert);
         free(l->lru_order);
         free(l->pos_in_lru);
+        free(l->pinned);
         free(l);
         return NULL;
     }
@@ -189,11 +248,130 @@ static void lru_touch(struct lru_t *l, int slot) {
     l->pos_in_lru[id] = 0;
 }
 
+static inline void lru_pin(struct lru_t *l, int slot) {
+    if (l && slot >= 0 && slot < l->cap) l->pinned[slot] = 1;
+}
+
+static inline void lru_unpin(struct lru_t *l, int slot) {
+    if (l && slot >= 0 && slot < l->cap) l->pinned[slot] = 0;
+}
+
+/* Encontra o slot LRU não-pinado mais antigo */
+static int lru_find_evict_slot(struct lru_t *l) {
+    for (int p = l->cap - 1; p >= 0; p--) {
+        int slot = l->lru_order[p];
+        if (!l->pinned[slot]) return slot;
+    }
+    return l->lru_order[l->cap - 1];
+}
+
 static void lru_destroy(struct lru_t *l) {
+    if (!l) return;
     free(l->slot_of_expert);
     free(l->lru_order);
     free(l->pos_in_lru);
+    free(l->pinned);
     free(l);
+}
+
+/* ------------------------------------------------------------------ */
+/* Prefetch assíncrono de SSD via worker thread dedicado (pthread)    */
+/* ------------------------------------------------------------------ */
+
+#define CROM_AIO_MAX_REQ 64
+
+typedef struct {
+    int expert_id;
+    int slot;
+    uint8_t *dst;
+    size_t size;
+    off_t offset;
+    int status; /* 0 = ok, -1 = erro */
+} crom_aio_req_t;
+
+typedef struct crom_async_io_t {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond_work;
+    pthread_cond_t cond_done;
+    int stop;
+    int busy;
+    crom_aio_req_t reqs[CROM_AIO_MAX_REQ];
+    int n_reqs;
+    int fd;
+    double io_ms;
+    long long bytes_read;
+} crom_async_io_t;
+
+static void *aio_worker_loop(void *arg) {
+    crom_async_io_t *aio = (crom_async_io_t *)arg;
+    while (1) {
+        pthread_mutex_lock(&aio->mutex);
+        while (!aio->stop && !aio->busy) {
+            pthread_cond_wait(&aio->cond_work, &aio->mutex);
+        }
+        if (aio->stop) {
+            pthread_mutex_unlock(&aio->mutex);
+            break;
+        }
+
+        /* Executa as requisições pendentes */
+        double t0 = now_ms();
+        long long b_read = 0;
+        for (int i = 0; i < aio->n_reqs; i++) {
+            crom_aio_req_t *req = &aio->reqs[i];
+            ssize_t rd = pread(aio->fd, req->dst, req->size, req->offset);
+            if (rd == (ssize_t)req->size) {
+                req->status = 0;
+                b_read += (long long)req->size;
+            } else {
+                req->status = -1;
+            }
+        }
+        double t1 = now_ms();
+        aio->io_ms += (t1 - t0);
+        aio->bytes_read += b_read;
+
+        aio->busy = 0;
+        pthread_cond_signal(&aio->cond_done);
+        pthread_mutex_unlock(&aio->mutex);
+    }
+    return NULL;
+}
+
+static crom_async_io_t *aio_create(int fd) {
+    crom_async_io_t *aio = calloc(1, sizeof(crom_async_io_t));
+    if (!aio) return NULL;
+    aio->fd = fd;
+    pthread_mutex_init(&aio->mutex, NULL);
+    pthread_cond_init(&aio->cond_work, NULL);
+    pthread_cond_init(&aio->cond_done, NULL);
+    if (pthread_create(&aio->thread, NULL, aio_worker_loop, aio) != 0) {
+        pthread_mutex_destroy(&aio->mutex);
+        pthread_cond_destroy(&aio->cond_work);
+        pthread_cond_destroy(&aio->cond_done);
+        free(aio);
+        return NULL;
+    }
+    return aio;
+}
+
+static void aio_destroy(crom_async_io_t *aio) {
+    if (!aio) return;
+    pthread_mutex_lock(&aio->mutex);
+    aio->stop = 1;
+    pthread_cond_signal(&aio->cond_work);
+    pthread_mutex_unlock(&aio->mutex);
+
+    pthread_join(aio->thread, NULL);
+    pthread_mutex_destroy(&aio->mutex);
+    pthread_cond_destroy(&aio->cond_work);
+    pthread_cond_destroy(&aio->cond_done);
+    free(aio);
+}
+
+void crom_set_sync_io(crom_model_t *m, int sync_io) {
+    if (m) m->sync_io = sync_io ? 1 : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -222,7 +400,7 @@ static int lru_get_expert(crom_model_t *m, int expert_id, uint8_t **out_ptr,
         return 0;
     }
     m->cache_misses++;
-    int evict_slot = l->lru_order[l->cap - 1];
+    int evict_slot = lru_find_evict_slot(l);
     int evict_id = -1;
     for (int i = 0; i < l->total_experts; i++) {
         if (l->slot_of_expert[i] == evict_slot) { evict_id = i; break; }
@@ -495,6 +673,13 @@ int crom_model_open_ctx(const char *path, crom_model_t *m, int cache_experts,
     m->moe_ms = 0.0;
     m->lm_head_ms = 0.0;
 
+    m->sync_io = 0; /* default assíncrono */
+    if (m->streaming) {
+        m->aio = aio_create(m->fd);
+    } else {
+        m->aio = NULL;
+    }
+
     return 0;
 }
 
@@ -661,29 +846,176 @@ int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
     float *moe_acc = m->moe_acc_buf;
     for (int i = 0; i < H; i++) moe_acc[i] = 0.0f;
 
-    for (int ei = 0; ei < num_top; ei++) {
-        int expert_id = top_exp[ei];
-        float w = top_weights[ei];
-        int dir_id = li * num_exp + expert_id;
-        crom_expert_t *E = &m->layers[li].experts[expert_id];
-        uint8_t *payload = NULL;
-        if (m->streaming) {
-            lru_get_expert(m, dir_id, &payload, NULL);
-        } else {
-            payload = (uint8_t *)m->expert_pool + (size_t)dir_id * m->expert_size;
-        }
-        size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
-        E->input_linear = q4_mat_from(payload, 2 * I, H);
-        E->output_linear = q4_mat_from(payload + in_sz, H, I);
+    if (!m->streaming) {
+        /* Modo RAM Full: todos os experts estão pré-carregados */
+        for (int ei = 0; ei < num_top; ei++) {
+            int expert_id = top_exp[ei];
+            float w = top_weights[ei];
+            int dir_id = li * num_exp + expert_id;
+            crom_expert_t *E = &m->layers[li].experts[expert_id];
+            uint8_t *payload = (uint8_t *)m->expert_pool + (size_t)dir_id * m->expert_size;
+            size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
+            E->input_linear = q4_mat_from(payload, 2 * I, H);
+            E->output_linear = q4_mat_from(payload + in_sz, H, I);
 
-        q4_matvec(&E->input_linear, work1, work3, m->threads);
-        for (int i = 0; i < I; i++) {
-            float g = silu(work3[i]);
-            float u = work3[I + i];
-            work3[i] = g * u;
+            q4_matvec(&E->input_linear, work1, work3, m->threads);
+            for (int i = 0; i < I; i++) {
+                float g = silu(work3[i]);
+                float u = work3[I + i];
+                work3[i] = g * u;
+            }
+            q4_matvec(&E->output_linear, work3, work4, m->threads);
+            for (int i = 0; i < H; i++) moe_acc[i] += work4[i] * w;
         }
-        q4_matvec(&E->output_linear, work3, work4, m->threads);
-        for (int i = 0; i < H; i++) moe_acc[i] += work4[i] * w;
+    } else if (m->sync_io || !m->aio) {
+        /* Modo Streaming Síncrono (--sync-io) */
+        for (int ei = 0; ei < num_top; ei++) {
+            int expert_id = top_exp[ei];
+            float w = top_weights[ei];
+            int dir_id = li * num_exp + expert_id;
+            crom_expert_t *E = &m->layers[li].experts[expert_id];
+            uint8_t *payload = NULL;
+            lru_get_expert(m, dir_id, &payload, NULL);
+            size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
+            E->input_linear = q4_mat_from(payload, 2 * I, H);
+            E->output_linear = q4_mat_from(payload + in_sz, H, I);
+
+            q4_matvec(&E->input_linear, work1, work3, m->threads);
+            for (int i = 0; i < I; i++) {
+                float g = silu(work3[i]);
+                float u = work3[I + i];
+                work3[i] = g * u;
+            }
+            q4_matvec(&E->output_linear, work3, work4, m->threads);
+            for (int i = 0; i < H; i++) moe_acc[i] += work4[i] * w;
+        }
+    } else {
+        /* Modo Streaming Assíncrono via worker pthread com sobreposição de compute/IO */
+        struct lru_t *l = m->lru;
+        crom_async_io_t *aio = m->aio;
+        int pinned_slots[num_top];
+        int n_pinned = 0;
+        int miss_req_idx[num_top];
+        int n_misses = 0;
+        uint8_t *payloads[num_top];
+
+        /* Classifica experts em HITs e MISSes e aloca slots */
+        for (int ei = 0; ei < num_top; ei++) {
+            int expert_id = top_exp[ei];
+            int dir_id = li * num_exp + expert_id;
+            int slot = l->slot_of_expert[dir_id];
+            if (slot >= 0) {
+                m->cache_hits++;
+                lru_touch(l, slot);
+                lru_pin(l, slot);
+                pinned_slots[n_pinned++] = slot;
+                payloads[ei] = (uint8_t *)m->expert_pool + (size_t)slot * m->expert_size;
+            } else {
+                m->cache_misses++;
+                int evict_slot = lru_find_evict_slot(l);
+                int evict_id = -1;
+                for (int i = 0; i < l->total_experts; i++) {
+                    if (l->slot_of_expert[i] == evict_slot) { evict_id = i; break; }
+                }
+                if (evict_id >= 0) l->slot_of_expert[evict_id] = -1;
+
+                l->slot_of_expert[dir_id] = evict_slot;
+                lru_pin(l, evict_slot);
+                pinned_slots[n_pinned++] = evict_slot;
+
+                uint8_t *dst = (uint8_t *)m->expert_pool + (size_t)evict_slot * m->expert_size;
+                payloads[ei] = dst;
+
+                const crom_dir_entry_t *e = &m->dir[dir_id];
+                crom_aio_req_t *req = &aio->reqs[n_misses];
+                req->expert_id = dir_id;
+                req->slot = evict_slot;
+                req->dst = dst;
+                req->size = (size_t)e->size_bytes;
+                req->offset = (off_t)e->offset_bytes;
+                req->status = -1;
+
+                miss_req_idx[n_misses] = ei;
+                n_misses++;
+            }
+        }
+
+        /* Se houver misses, dispara prefetch em background no pthread */
+        if (n_misses > 0) {
+            pthread_mutex_lock(&aio->mutex);
+            aio->n_reqs = n_misses;
+            aio->busy = 1;
+            pthread_cond_signal(&aio->cond_work);
+            pthread_mutex_unlock(&aio->mutex);
+        }
+
+        /* Enquanto o SSD lê no pthread, calcula os HITs nos threads OpenMP */
+        for (int ei = 0; ei < num_top; ei++) {
+            int is_miss = 0;
+            for (int mi = 0; mi < n_misses; mi++) {
+                if (miss_req_idx[mi] == ei) { is_miss = 1; break; }
+            }
+            if (!is_miss) {
+                int expert_id = top_exp[ei];
+                float w = top_weights[ei];
+                crom_expert_t *E = &m->layers[li].experts[expert_id];
+                uint8_t *payload = payloads[ei];
+                size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
+                E->input_linear = q4_mat_from(payload, 2 * I, H);
+                E->output_linear = q4_mat_from(payload + in_sz, H, I);
+
+                q4_matvec(&E->input_linear, work1, work3, m->threads);
+                for (int i = 0; i < I; i++) {
+                    float g = silu(work3[i]);
+                    float u = work3[I + i];
+                    work3[i] = g * u;
+                }
+                q4_matvec(&E->output_linear, work3, work4, m->threads);
+                for (int i = 0; i < H; i++) moe_acc[i] += work4[i] * w;
+            }
+        }
+
+        /* Aguarda término do prefetch de misses */
+        if (n_misses > 0) {
+            pthread_mutex_lock(&aio->mutex);
+            while (aio->busy) {
+                pthread_cond_wait(&aio->cond_done, &aio->mutex);
+            }
+            m->ssd_stream_bytes_read += aio->bytes_read;
+            aio->bytes_read = 0;
+            m->ssd_io_ms += aio->io_ms;
+            aio->io_ms = 0.0;
+            pthread_mutex_unlock(&aio->mutex);
+
+            /* Calcula os experts que acabaram de chegar do SSD */
+            for (int mi = 0; mi < n_misses; mi++) {
+                int ei = miss_req_idx[mi];
+                int expert_id = top_exp[ei];
+                float w = top_weights[ei];
+                int slot = aio->reqs[mi].slot;
+                lru_touch(l, slot);
+
+                crom_expert_t *E = &m->layers[li].experts[expert_id];
+                uint8_t *payload = payloads[ei];
+                size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
+                E->input_linear = q4_mat_from(payload, 2 * I, H);
+                E->output_linear = q4_mat_from(payload + in_sz, H, I);
+
+                q4_matvec(&E->input_linear, work1, work3, m->threads);
+                for (int i = 0; i < I; i++) {
+                    float g = silu(work3[i]);
+                    float u = work3[I + i];
+                    work3[i] = g * u;
+                }
+                q4_matvec(&E->output_linear, work3, work4, m->threads);
+                for (int i = 0; i < H; i++) moe_acc[i] += work4[i] * w;
+            }
+        }
+
+        /* Despina os slots da camada */
+        for (int i = 0; i < n_pinned; i++) {
+            lru_unpin(l, pinned_slots[i]);
+        }
     }
 
     for (int i = 0; i < H; i++)
@@ -759,6 +1091,481 @@ int crom_forward(crom_model_t *m, const int *input_ids, int n_ids,
         out_logits[v] = s / m->logits_scaling;
     }
     m->lm_head_ms += now_ms() - t0;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* forward em lote (batch prefill com GEMM e MoE agrupado)            */
+/* ------------------------------------------------------------------ */
+
+int crom_forward_batch(crom_model_t *m, const int *input_ids, int n_tokens,
+                       int start_pos, float *out_logits) {
+    if (n_tokens <= 0) return 0;
+    if (n_tokens == 1) {
+        float *hidden = m->work1;
+        return crom_forward(m, input_ids, 1, start_pos, hidden, out_logits);
+    }
+
+    int B = n_tokens;
+    int H = m->hidden_size;
+    int I = m->intermediate_size;
+    int num_q_heads = m->num_attn_heads;
+    int num_kv_heads = m->num_kv_heads;
+    int head_dim = m->head_dim;
+    int kv_group = num_q_heads / num_kv_heads;
+    int num_exp = m->num_local_experts;
+    int num_top = m->num_experts_per_tok;
+
+    /* Tamanho necessário de buffer para B tokens:
+     * hidden [B * H]
+     * norm_buf [B * H]
+     * q_buf [B * num_q_heads * head_dim]
+     * k_buf [B * num_kv_heads * head_dim]
+     * v_buf [B * num_kv_heads * head_dim]
+     * attn_out [B * num_q_heads * head_dim]
+     * o_buf [B * H]
+     * moe_inter [B * 2 * I]
+     * moe_out [B * H]
+     */
+    size_t q_dim = (size_t)num_q_heads * head_dim;
+    size_t kv_dim = (size_t)num_kv_heads * head_dim;
+    size_t in_exp_dim = 2 * (size_t)I;
+
+    size_t needed = (size_t)B * (H * 4 + q_dim * 2 + kv_dim * 2 + in_exp_dim + H);
+    if (m->batch_work_cap < needed) {
+        if (m->batch_work) free(m->batch_work);
+        m->batch_work = aligned_alloc(CROM_PAGE, needed * sizeof(float));
+        if (!m->batch_work) {
+            perror("aligned_alloc batch_work");
+            m->batch_work_cap = 0;
+            return -1;
+        }
+        m->batch_work_cap = needed;
+    }
+
+    float *bw = m->batch_work;
+    float *hidden    = bw; bw += (size_t)B * H;
+    float *norm_buf  = bw; bw += (size_t)B * H;
+    float *q_buf     = bw; bw += (size_t)B * q_dim;
+    float *k_buf     = bw; bw += (size_t)B * kv_dim;
+    float *v_buf     = bw; bw += (size_t)B * kv_dim;
+    float *attn_out  = bw; bw += (size_t)B * q_dim;
+    float *o_buf     = bw; bw += (size_t)B * H;
+    float *moe_inter = bw; bw += (size_t)B * in_exp_dim;
+    float *moe_out   = bw; /* [B * H] */
+
+    /* 1. Embedding lookup para todos os B tokens */
+    for (int b = 0; b < B; b++) {
+        crom_embed(m, input_ids[b], hidden + (size_t)b * H);
+    }
+
+    /* 2. Processa camada por camada */
+    for (int li = 0; li < (int)m->num_layers; li++) {
+        double t_attn0 = now_ms();
+
+        /* 2a. Input layernorm para os B tokens */
+        float *rms_w_in = m->norms_f32 + (size_t)li * 2 * H;
+#pragma omp parallel for schedule(static)
+        for (int b = 0; b < B; b++) {
+            crom_rms_norm(rms_w_in, hidden + (size_t)b * H, H, m->rms_norm_eps,
+                          norm_buf + (size_t)b * H);
+        }
+
+        /* 2b. Q, K, V batch GEMM */
+        crom_attn_t *A = &m->layers[li].attn;
+        q4_matmul_batch(&A->q_proj, norm_buf, B, H, q_buf, (int)q_dim, m->threads);
+        q4_matmul_batch(&A->k_proj, norm_buf, B, H, k_buf, (int)kv_dim, m->threads);
+        q4_matmul_batch(&A->v_proj, norm_buf, B, H, v_buf, (int)kv_dim, m->threads);
+
+        /* 2c. RoPE e preenchimento do KV cache */
+        float *k_cache = m->k_cache;
+        float *v_cache = m->v_cache;
+
+        for (int b = 0; b < B; b++) {
+            int pos = start_pos + b;
+            float *qb = q_buf + (size_t)b * q_dim;
+            float *kb = k_buf + (size_t)b * kv_dim;
+            float *vb = v_buf + (size_t)b * kv_dim;
+
+            for (int h = 0; h < num_q_heads; h++) {
+                rope_split_half(qb + h * head_dim, pos, m->inv_freq, head_dim);
+            }
+            for (int h = 0; h < num_kv_heads; h++) {
+                rope_split_half(kb + h * head_dim, pos, m->inv_freq, head_dim);
+            }
+
+            for (int h = 0; h < num_kv_heads; h++) {
+                memcpy(k_cache + KV_OFF(m, li, h, pos), kb + h * head_dim,
+                       head_dim * sizeof(float));
+                memcpy(v_cache + KV_OFF(m, li, h, pos), vb + h * head_dim,
+                       head_dim * sizeof(float));
+            }
+        }
+
+        /* 2d. Causal GQA attention para os B tokens */
+#pragma omp parallel for schedule(dynamic)
+        for (int b = 0; b < B; b++) {
+            int pos = start_pos + b;
+            int seqlen = pos + 1;
+            if (seqlen > m->max_seq) seqlen = m->max_seq;
+            float *qb = q_buf + (size_t)b * q_dim;
+            float *ab = attn_out + (size_t)b * q_dim;
+            float scores_local[m->max_seq];
+
+            for (int h = 0; h < num_q_heads; h++) {
+                int kvh = h / kv_group;
+                float *q = qb + h * head_dim;
+                float maxs = -1e30f;
+                for (int t = 0; t < seqlen; t++) {
+                    float s = 0.0f;
+                    const float *k = k_cache + KV_OFF(m, li, kvh, t);
+                    for (int d = 0; d < head_dim; d++) s += q[d] * k[d];
+                    s *= m->attention_multiplier;
+                    scores_local[t] = s;
+                    if (s > maxs) maxs = s;
+                }
+                float sum = 0.0f;
+                for (int t = 0; t < seqlen; t++) {
+                    scores_local[t] = expf(scores_local[t] - maxs);
+                    sum += scores_local[t];
+                }
+                float inv = 1.0f / sum;
+                float *acc = ab + h * head_dim;
+                for (int d = 0; d < head_dim; d++) acc[d] = 0.0f;
+                for (int t = 0; t < seqlen; t++) {
+                    float w = scores_local[t] * inv;
+                    const float *v = v_cache + KV_OFF(m, li, kvh, t);
+                    for (int d = 0; d < head_dim; d++) acc[d] += v[d] * w;
+                }
+            }
+        }
+
+        /* 2e. O projection batch GEMM */
+        q4_matmul_batch(&A->o_proj, attn_out, B, (int)q_dim, o_buf, H, m->threads);
+
+        /* 2f. Residual connection */
+#pragma omp parallel for schedule(static)
+        for (int b = 0; b < B; b++) {
+            float *hb = hidden + (size_t)b * H;
+            const float *ob = o_buf + (size_t)b * H;
+            for (int i = 0; i < H; i++) {
+                hb[i] += ob[i] * m->residual_multiplier;
+            }
+        }
+        m->attn_ms += now_ms() - t_attn0;
+
+        /* 2g. MoE Layer com agrupamento por expert */
+        double t_moe0 = now_ms();
+        float *rms_w_post = m->norms_f32 + (size_t)li * 2 * H + H;
+#pragma omp parallel for schedule(static)
+        for (int b = 0; b < B; b++) {
+            crom_rms_norm(rms_w_post, hidden + (size_t)b * H, H, m->rms_norm_eps,
+                          norm_buf + (size_t)b * H);
+        }
+
+        /* Router logits e top-k para todos os B tokens */
+        int all_top_exp[B * num_top];
+        float all_top_w[B * num_top];
+        float *router_w = m->layers[li].router_weight;
+
+        for (int b = 0; b < B; b++) {
+            const float *x = norm_buf + (size_t)b * H;
+            float r_logits[num_exp];
+            int r_idx[num_exp];
+            for (int e = 0; e < num_exp; e++) {
+                float s = 0.0f;
+                const float *rw = router_w + (size_t)e * H;
+                for (int i = 0; i < H; i++) s += x[i] * rw[i];
+                r_logits[e] = s;
+                r_idx[e] = e;
+            }
+
+            for (int i = 0; i < num_top; i++) {
+                int max_j = i;
+                for (int j = i + 1; j < num_exp; j++) {
+                    if (r_logits[r_idx[j]] > r_logits[r_idx[max_j]]) max_j = j;
+                }
+                if (max_j != i) {
+                    int tmp = r_idx[i];
+                    r_idx[i] = r_idx[max_j];
+                    r_idx[max_j] = tmp;
+                }
+            }
+
+            int *tb_exp = all_top_exp + b * num_top;
+            float *tb_w = all_top_w + b * num_top;
+            float ml = -1e30f;
+            for (int i = 0; i < num_top; i++) {
+                tb_exp[i] = r_idx[i];
+                float l = r_logits[tb_exp[i]];
+                if (l > ml) ml = l;
+            }
+            float sK = 0.0f;
+            for (int i = 0; i < num_top; i++) {
+                tb_w[i] = expf(r_logits[tb_exp[i]] - ml);
+                sK += tb_w[i];
+            }
+            float invK = 1.0f / sK;
+            for (int i = 0; i < num_top; i++) {
+                tb_w[i] *= invK;
+            }
+        }
+
+        /* Inicializa moe_out com zeros */
+        memset(moe_out, 0, (size_t)B * H * sizeof(float));
+
+        /* Agrupamento: mapeia quais tokens utilizam cada expert e */
+        int exp_tokens[num_exp][B];
+        float exp_weights[num_exp][B];
+        int exp_count[num_exp];
+        for (int e = 0; e < num_exp; e++) exp_count[e] = 0;
+
+        for (int b = 0; b < B; b++) {
+            const int *tb_exp = all_top_exp + b * num_top;
+            const float *tb_w = all_top_w + b * num_top;
+            for (int k = 0; k < num_top; k++) {
+                int e = tb_exp[k];
+                int c = exp_count[e];
+                exp_tokens[e][c] = b;
+                exp_weights[e][c] = tb_w[k];
+                exp_count[e]++;
+            }
+        }
+
+        /* Identifica experts ativos e gerencia cache/prefetch */
+        int active_experts[num_exp];
+        int n_active = 0;
+        for (int e = 0; e < num_exp; e++) {
+            if (exp_count[e] > 0) active_experts[n_active++] = e;
+        }
+
+        /* Obtém payloads para todos os experts ativos */
+        uint8_t *exp_payload[num_exp];
+        for (int e = 0; e < num_exp; e++) exp_payload[e] = NULL;
+
+        if (!m->streaming) {
+            for (int i = 0; i < n_active; i++) {
+                int e = active_experts[i];
+                int dir_id = li * num_exp + e;
+                exp_payload[e] = (uint8_t *)m->expert_pool + (size_t)dir_id * m->expert_size;
+            }
+        } else if (m->sync_io || !m->aio) {
+            for (int i = 0; i < n_active; i++) {
+                int e = active_experts[i];
+                int dir_id = li * num_exp + e;
+                lru_get_expert(m, dir_id, &exp_payload[e], NULL);
+            }
+        } else {
+            /* Modo assíncrono com prefetch em lote e slot pinning */
+            struct lru_t *l = m->lru;
+            crom_async_io_t *aio = m->aio;
+            int pinned_slots[n_active];
+            int n_pinned = 0;
+            int miss_exp_idx[n_active];
+            int n_misses = 0;
+
+            for (int i = 0; i < n_active; i++) {
+                int e = active_experts[i];
+                int dir_id = li * num_exp + e;
+                int slot = l->slot_of_expert[dir_id];
+                if (slot >= 0) {
+                    m->cache_hits++;
+                    lru_touch(l, slot);
+                    lru_pin(l, slot);
+                    pinned_slots[n_pinned++] = slot;
+                    exp_payload[e] = (uint8_t *)m->expert_pool + (size_t)slot * m->expert_size;
+                } else {
+                    m->cache_misses++;
+                    int evict_slot = lru_find_evict_slot(l);
+                    int evict_id = -1;
+                    for (int j = 0; j < l->total_experts; j++) {
+                        if (l->slot_of_expert[j] == evict_slot) { evict_id = j; break; }
+                    }
+                    if (evict_id >= 0) l->slot_of_expert[evict_id] = -1;
+
+                    l->slot_of_expert[dir_id] = evict_slot;
+                    lru_pin(l, evict_slot);
+                    pinned_slots[n_pinned++] = evict_slot;
+
+                    uint8_t *dst = (uint8_t *)m->expert_pool + (size_t)evict_slot * m->expert_size;
+                    exp_payload[e] = dst;
+
+                    const crom_dir_entry_t *de = &m->dir[dir_id];
+                    crom_aio_req_t *req = &aio->reqs[n_misses];
+                    req->expert_id = dir_id;
+                    req->slot = evict_slot;
+                    req->dst = dst;
+                    req->size = (size_t)de->size_bytes;
+                    req->offset = (off_t)de->offset_bytes;
+                    req->status = -1;
+
+                    miss_exp_idx[n_misses] = e;
+                    n_misses++;
+                }
+            }
+
+            if (n_misses > 0) {
+                pthread_mutex_lock(&aio->mutex);
+                aio->n_reqs = n_misses;
+                aio->busy = 1;
+                pthread_cond_signal(&aio->cond_work);
+                pthread_mutex_unlock(&aio->mutex);
+            }
+
+            /* Enquanto o SSD lê no background, processa os experts que foram HIT */
+            for (int i = 0; i < n_active; i++) {
+                int e = active_experts[i];
+                int is_miss = 0;
+                for (int mi = 0; mi < n_misses; mi++) {
+                    if (miss_exp_idx[mi] == e) { is_miss = 1; break; }
+                }
+                if (!is_miss) {
+                    int C = exp_count[e];
+                    crom_expert_t *E = &m->layers[li].experts[e];
+                    uint8_t *payload = exp_payload[e];
+                    size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
+                    E->input_linear = q4_mat_from(payload, 2 * I, H);
+                    E->output_linear = q4_mat_from(payload + in_sz, H, I);
+
+                    for (int c = 0; c < C; c++) {
+                        int b = exp_tokens[e][c];
+                        float w = exp_weights[e][c];
+                        const float *x = norm_buf + (size_t)b * H;
+                        float *inter = moe_inter + (size_t)b * in_exp_dim;
+                        float out_v[H];
+
+                        q4_matvec(&E->input_linear, x, inter, m->threads);
+                        for (int k = 0; k < I; k++) {
+                            float g = silu(inter[k]);
+                            float u = inter[I + k];
+                            inter[k] = g * u;
+                        }
+                        q4_matvec(&E->output_linear, inter, out_v, m->threads);
+                        float *mb = moe_out + (size_t)b * H;
+                        for (int k = 0; k < H; k++) mb[k] += out_v[k] * w;
+                    }
+                }
+            }
+
+            if (n_misses > 0) {
+                pthread_mutex_lock(&aio->mutex);
+                while (aio->busy) {
+                    pthread_cond_wait(&aio->cond_done, &aio->mutex);
+                }
+                m->ssd_stream_bytes_read += aio->bytes_read;
+                aio->bytes_read = 0;
+                m->ssd_io_ms += aio->io_ms;
+                aio->io_ms = 0.0;
+                pthread_mutex_unlock(&aio->mutex);
+
+                /* Processa experts que acabaram de chegar do SSD */
+                for (int mi = 0; mi < n_misses; mi++) {
+                    int e = miss_exp_idx[mi];
+                    int slot = aio->reqs[mi].slot;
+                    lru_touch(l, slot);
+
+                    int C = exp_count[e];
+                    crom_expert_t *E = &m->layers[li].experts[e];
+                    uint8_t *payload = exp_payload[e];
+                    size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
+                    E->input_linear = q4_mat_from(payload, 2 * I, H);
+                    E->output_linear = q4_mat_from(payload + in_sz, H, I);
+
+                    for (int c = 0; c < C; c++) {
+                        int b = exp_tokens[e][c];
+                        float w = exp_weights[e][c];
+                        const float *x = norm_buf + (size_t)b * H;
+                        float *inter = moe_inter + (size_t)b * in_exp_dim;
+                        float out_v[H];
+
+                        q4_matvec(&E->input_linear, x, inter, m->threads);
+                        for (int k = 0; k < I; k++) {
+                            float g = silu(inter[k]);
+                            float u = inter[I + k];
+                            inter[k] = g * u;
+                        }
+                        q4_matvec(&E->output_linear, inter, out_v, m->threads);
+                        float *mb = moe_out + (size_t)b * H;
+                        for (int k = 0; k < H; k++) mb[k] += out_v[k] * w;
+                    }
+                }
+            }
+
+            for (int i = 0; i < n_pinned; i++) {
+                lru_unpin(l, pinned_slots[i]);
+            }
+        }
+
+        /* Se executou em RAM ou sync_io, calcula todos os experts ativos agora */
+        if (!m->streaming || m->sync_io || !m->aio) {
+            for (int i = 0; i < n_active; i++) {
+                int e = active_experts[i];
+                int C = exp_count[e];
+                crom_expert_t *E = &m->layers[li].experts[e];
+                uint8_t *payload = exp_payload[e];
+                size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
+                E->input_linear = q4_mat_from(payload, 2 * I, H);
+                E->output_linear = q4_mat_from(payload + in_sz, H, I);
+
+                for (int c = 0; c < C; c++) {
+                    int b = exp_tokens[e][c];
+                    float w = exp_weights[e][c];
+                    const float *x = norm_buf + (size_t)b * H;
+                    float *inter = moe_inter + (size_t)b * in_exp_dim;
+                    float out_v[H];
+
+                    q4_matvec(&E->input_linear, x, inter, m->threads);
+                    for (int k = 0; k < I; k++) {
+                        float g = silu(inter[k]);
+                        float u = inter[I + k];
+                        inter[k] = g * u;
+                    }
+                    q4_matvec(&E->output_linear, inter, out_v, m->threads);
+                    float *mb = moe_out + (size_t)b * H;
+                    for (int k = 0; k < H; k++) mb[k] += out_v[k] * w;
+                }
+            }
+        }
+
+        /* 2h. Residual MoE */
+#pragma omp parallel for schedule(static)
+        for (int b = 0; b < B; b++) {
+            float *hb = hidden + (size_t)b * H;
+            const float *mb = moe_out + (size_t)b * H;
+            for (int k = 0; k < H; k++) {
+                hb[k] += mb[k] * m->residual_multiplier;
+            }
+        }
+        m->moe_ms += now_ms() - t_moe0;
+    }
+
+    /* 3. Se out_logits fornecido, computa logits apenas para o último token */
+    if (out_logits) {
+        float *last_hidden = hidden + (size_t)(B - 1) * H;
+        float *final_norm_w = m->norms_f32 + (size_t)(m->num_layers * 2) * H;
+        crom_rms_norm(final_norm_w, last_hidden, H, m->rms_norm_eps, norm_buf);
+
+        double t0 = now_ms();
+        int vocab = m->vocab_size;
+        const uint16_t *embed = m->embed_f16;
+#pragma omp parallel for schedule(static)
+        for (int v = 0; v < vocab; v++) {
+            __m256 vacc = _mm256_setzero_ps();
+            const uint16_t *ev = embed + (size_t)v * H;
+            const float *h = norm_buf;
+            int i = 0;
+            for (; i + 7 < H; i += 8) {
+                __m128i f16 = _mm_loadu_si128((const __m128i *)(ev + i));
+                __m256 e = _mm256_cvtph_ps(f16);
+                vacc = _mm256_fmadd_ps(e, _mm256_loadu_ps(h + i), vacc);
+            }
+            float s = hsum256(vacc);
+            for (; i < H; i++) s += _cvtsh_ss(ev[i]) * h[i];
+            out_logits[v] = s / m->logits_scaling;
+        }
+        m->lm_head_ms += now_ms() - t0;
+    }
+
     return 0;
 }
 
@@ -856,6 +1663,15 @@ void crom_model_close(crom_model_t *m) {
     free(m->top_experts);
     free(m->top_weights);
     free(m->top_logits);
+    if (m->aio) {
+        aio_destroy(m->aio);
+        m->aio = NULL;
+    }
+    if (m->batch_work) {
+        free(m->batch_work);
+        m->batch_work = NULL;
+        m->batch_work_cap = 0;
+    }
     if (m->fd >= 0) close(m->fd);
     if (m->path) free((void*)m->path);
 }

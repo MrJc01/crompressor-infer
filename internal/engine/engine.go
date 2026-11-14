@@ -2,7 +2,7 @@ package engine
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../engine
-#cgo LDFLAGS: -L${SRCDIR}/../../engine -lcrom_infer -lm -fopenmp
+#cgo LDFLAGS: -L${SRCDIR}/../../engine -lcrom_infer -lm -fopenmp -lpthread
 
 #include "crom_infer.h"
 #include <stdlib.h>
@@ -103,6 +103,37 @@ func (m *Model) Forward(inputIDs []int, position int, hidden, outLogits []float3
 		return errors.New("forward failed")
 	}
 	return nil
+}
+
+// ForwardBatch processes multiple tokens in batch (GEMM + grouped MoE) and optionally produces logits for the last token
+func (m *Model) ForwardBatch(inputIDs []int, startPos int, outLogits []float32) error {
+	n := len(inputIDs)
+	if n == 0 {
+		return nil
+	}
+	cInputIDs := make([]C.int, n)
+	for i, id := range inputIDs {
+		cInputIDs[i] = C.int(id)
+	}
+	var cOutLogits *C.float
+	if len(outLogits) > 0 {
+		cOutLogits = (*C.float)(unsafe.Pointer(&outLogits[0]))
+	}
+
+	ret := C.crom_forward_batch(&m.model, &cInputIDs[0], C.int(n), C.int(startPos), cOutLogits)
+	if ret != 0 {
+		return errors.New("forward_batch failed")
+	}
+	return nil
+}
+
+// SetSyncIO toggles synchronous vs asynchronous IO for SSD streaming
+func (m *Model) SetSyncIO(syncIO bool) {
+	val := C.int(0)
+	if syncIO {
+		val = C.int(1)
+	}
+	C.crom_set_sync_io(&m.model, val)
 }
 
 // Embed looks up token embedding

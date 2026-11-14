@@ -117,6 +117,14 @@ typedef struct {
     float *top_weights;
     float *top_logits;
 
+    /* prefetch assíncrono SSD via pthread */
+    int sync_io;                      /* 1 = síncrono, 0 = assíncrono (padrão) */
+    struct crom_async_io_t *aio;
+
+    /* buffers dedicados para batch prefill */
+    float *batch_work;
+    size_t batch_work_cap;
+
     long long cache_hits;
     long long cache_misses;
     long long ssd_bytes_read;
@@ -143,6 +151,9 @@ int crom_model_open_ctx(const char *path, crom_model_t *m, int cache_experts, in
 void crom_model_close(crom_model_t *m);
 int crom_forward(crom_model_t *m, const int *input_ids, int n_ids,
                  int position, float *hidden, float *out_logits);
+int crom_forward_batch(crom_model_t *m, const int *input_ids, int n_tokens,
+                       int start_pos, float *out_logits);
+void crom_set_sync_io(crom_model_t *m, int sync_io);
 int crom_embed(crom_model_t *m, int token_id, float *hidden);
 int crom_layer_attn_resid(crom_model_t *m, int li, const float *hidden_in,
                           int pos, float *hidden_out);

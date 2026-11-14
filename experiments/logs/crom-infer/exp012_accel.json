@@ -1,0 +1,80 @@
+{
+  "experiment": "EXP-012",
+  "date": "2026-11-14",
+  "hardware": {
+    "cpu": "AMD Ryzen 5 5600GT (6C/12T, AVX2+FMA+F16C)",
+    "ram_total_gib": 14,
+    "ssd": "SATA SSD 512GB",
+    "threads": 6
+  },
+  "prefill_benchmarks_cache_768": {
+    "prompt_1": {
+      "prompt": "Explique em 3 frases curtas como funciona uma tabela hash.",
+      "prefill_tok_s": 90.68,
+      "decode_tok_s": 53.35,
+      "cache_hit_pct": 100.0,
+      "rss_mb": 1017.76
+    },
+    "prompt_2": {
+      "prompt": "What is a Mixture-of-Experts neural network? Answer concisely in 3 sentences.",
+      "prefill_tok_s": 91.23,
+      "decode_tok_s": 54.67,
+      "cache_hit_pct": 100.0,
+      "rss_mb": 1017.79
+    },
+    "prompt_3": {
+      "prompt": "Escreva apenas uma função em C que soma dois vetores float de tamanho n. Sem texto extra.",
+      "prefill_tok_s": 90.64,
+      "decode_tok_s": 52.98,
+      "cache_hit_pct": 100.0,
+      "rss_mb": 1018.06
+    },
+    "prompt_4": {
+      "prompt": "Resolva passo a passo e dê o resultado final: Se um disco lê a 250 MB/s e cada especialista tem 10 MB, quantos milissegundos leva para ler 8 especialistas?",
+      "prefill_tok_s": 89.88,
+      "decode_tok_s": 51.36,
+      "cache_hit_pct": 100.0,
+      "rss_mb": 1019.17
+    },
+    "media_prefill_tok_s": 90.61,
+    "exp010_baseline_prefill_tok_s": 52.92,
+    "ollama_baseline_prefill_tok_s": 587.80,
+    "speedup_vs_exp010": 1.71
+  },
+  "async_vs_sync_ssd_prompt_2": {
+    "mode_576": {
+      "sync_io": {
+        "prefill_tok_s": 24.75,
+        "decode_tok_s": 15.62,
+        "moe_ms": 7355.08,
+        "cache_hit_pct": 88.39,
+        "ssd_stream_mb": 1503.56
+      },
+      "async_io": {
+        "prefill_tok_s": 25.08,
+        "decode_tok_s": 16.18,
+        "moe_ms": 7134.86,
+        "cache_hit_pct": 88.39,
+        "ssd_stream_mb": 1503.56
+      },
+      "decode_speedup_async_vs_sync": 1.036
+    },
+    "mode_384": {
+      "sync_io": {
+        "prefill_tok_s": 25.37,
+        "decode_tok_s": 4.04,
+        "moe_ms": 21185.86,
+        "cache_hit_pct": 62.14,
+        "ssd_stream_mb": 4903.88
+      },
+      "async_io": {
+        "prefill_tok_s": 24.59,
+        "decode_tok_s": 4.07,
+        "moe_ms": 21113.55,
+        "cache_hit_pct": 62.15,
+        "ssd_stream_mb": 4903.03
+      },
+      "decode_speedup_async_vs_sync": 1.007
+    }
+  }
+}
