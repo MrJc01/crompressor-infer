@@ -149,24 +149,25 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 8; i++) printf("%.6f%s", w8_l23[i], i < 7 ? ", " : "");
         printf("]\n");
 
-        /* lm_head sobre hidden apos L23 (final_norm sobre hidden2 apos moe L23) */
+/* lm_head sobre hidden apos L23 (final_norm sobre hidden2 apos moe L23) */
         float *fn = aligned_alloc(4096, H * sizeof(float));
         float *final_norm_w = m.norms_f32 + (size_t)(m.num_layers * 2) * H;
-        crom_rms_norm(final_norm_w, hidden2, H, m.rms_norm_eps, fn);  /* antes: hidden */
-        const float *embed = m.embed_f32;
+        crom_rms_norm(final_norm_w, hidden2, H, m.rms_norm_eps, fn);
+        const uint16_t *embed = m.embed_f16;
 #pragma omp parallel for schedule(static)
         for (int v = 0; v < CROM_VOCAB_SIZE; v++) {
             float s = 0.0f;
-            const float *ev = embed + (size_t)v * H;
+            const uint16_t *ev = embed + (size_t)v * H;
             int i = 0;
             for (; i + 7 < H; i += 8) {
-                __m256 e = _mm256_loadu_ps(ev + i);
+                __m128i f16 = _mm_loadu_si128((const __m128i *)(ev + i));
+                __m256 e = _mm256_cvtph_ps(f16);
                 __m256 hh = _mm256_loadu_ps(fn + i);
                 __m256 p = _mm256_mul_ps(e, hh);
                 const float *pf = (const float *)&p;
                 s += pf[0] + pf[1] + pf[2] + pf[3] + pf[4] + pf[5] + pf[6] + pf[7];
             }
-            for (; i < H; i++) s += ev[i] * fn[i];
+            for (; i < H; i++) s += _cvtsh_ss(ev[i]) * fn[i];
             logits[v] = s / m.logits_scaling;
         }
         free(fn);
@@ -200,9 +201,9 @@ int main(int argc, char **argv) {
     double prefill_tok = (n_ids - 1 > 0) ? (double)(n_ids - 1) / prefill_s : 0.0;
     double decode_tok = (n_gen > 0 && decode_s > 0) ? (double)n_gen / decode_s : 0.0;
 
-    long long hits, misses, bytes;
+    long long hits, misses, bytes, stream_bytes;
     double io_ms;
-    crom_stats(&m, &hits, &misses, &bytes, &io_ms);
+    crom_stats(&m, &hits, &misses, &bytes, &stream_bytes, &io_ms);
     long long total = hits + misses;
     double hit_pct = total > 0 ? 100.0 * (double)hits / (double)total : 100.0;
 
@@ -217,9 +218,9 @@ int main(int argc, char **argv) {
     }
 
     printf("load_ms=%.1f prefill_tok/s=%.2f decode_tok/s=%.2f RSS_MB=%.1f "
-           "cache_hit%%=%.2f ssd_MB=%.2f ssd_io_ms=%.1f threads=%d cache=%d\n",
+           "cache_hit%%=%.2f preload_MB=%.2f ssd_stream_MB=%.2f ssd_io_ms=%.1f threads=%d cache=%d\n",
            load_ms, prefill_tok, decode_tok, (double)rss_kb / 1024.0,
-           hit_pct, (double)bytes / (1024.0 * 1024.0), io_ms, threads, cache_experts);
+           hit_pct, (double)bytes / (1024.0 * 1024.0), (double)stream_bytes / (1024.0 * 1024.0), io_ms, threads, cache_experts);
 
     crom_model_close(&m);
     free(hidden);

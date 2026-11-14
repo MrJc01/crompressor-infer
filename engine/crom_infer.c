@@ -171,7 +171,8 @@ static int read_expert_payload(crom_model_t *m, int expert_id, uint8_t *dst) {
     ssize_t rd = pread(m->fd, dst, (size_t)e->size_bytes, (off_t)e->offset_bytes);
     if (rd < 0) return -1;
     if ((size_t)rd != e->size_bytes) return -1;
-    m->ssd_bytes_read += (long long)e->size_bytes;
+    if (m->streaming) m->ssd_stream_bytes_read += (long long)e->size_bytes;
+    else m->ssd_bytes_read += (long long)e->size_bytes;
     return 0;
 }
 
@@ -304,17 +305,10 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
     unsigned char *base = (unsigned char *)m->hot_base;
     size_t off = 0;
 
-    /* embed [vocab, hidden] F16 -> FP32 */
+    /* embed [vocab, hidden] F16 (mantém em F16 — ~96 MiB) */
     size_t embed_raw = (size_t)CROM_VOCAB_SIZE * CROM_HIDDEN_SIZE * 2;
     size_t embed_pad = (embed_raw + CROM_PAGE - 1) & ~(CROM_PAGE - 1);
-    m->embed_f32 = malloc((size_t)CROM_VOCAB_SIZE * CROM_HIDDEN_SIZE * sizeof(float));
-    if (!m->embed_f32) { perror("malloc embed"); return -1; }
-    {
-        const uint16_t *f16 = (const uint16_t *)(base + off);
-        float *f32 = m->embed_f32;
-        size_t ne = (size_t)CROM_VOCAB_SIZE * CROM_HIDDEN_SIZE;
-        for (size_t i = 0; i < ne; i++) f32[i] = _cvtsh_ss(f16[i]);
-    }
+    m->embed_f16 = (uint16_t *)(base + off);
     off = embed_pad;
 
     /* norms [49, hidden] FP32 */
@@ -393,18 +387,22 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
     if (!m->expert_pool) { perror("aligned_alloc pool"); return -1; }
     m->lru = lru_create(cache_experts);
 
+    long long preload_bytes = 0;
     if (!m->streaming) {
         for (int i = 0; i < CROM_NUM_DIR_ENTRIES; i++) {
             uint8_t *dst = (uint8_t *)m->expert_pool + (size_t)i * CROM_EXPERT_SIZE;
             if (read_expert_payload(m, i, dst) != 0) {
                 fprintf(stderr, "preload expert %d falhou\n", i); return -1;
             }
+            preload_bytes += CROM_EXPERT_SIZE;
             m->lru->slot_of_expert[i] = i;
             m->lru->lru_order[i] = i;
             m->lru->pos_in_lru[i] = i;
             m->cache_hits++;
         }
     }
+    m->ssd_bytes_read = preload_bytes;
+    m->ssd_stream_bytes_read = 0;
 
     /* KV-cache */
     size_t kv_elems = (size_t)CROM_NUM_LAYERS * CROM_NUM_KV_HEADS * CROM_MAX_SEQ * CROM_HEAD_DIM;
@@ -588,14 +586,23 @@ int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
 }
 
 /* ------------------------------------------------------------------ */
-/* embed lookup                                                       */
+/* embed lookup (F16 -> FP32 on-the-fly com AVX2 _mm256_cvtph_ps)     */
 /* ------------------------------------------------------------------ */
 
 int crom_embed(crom_model_t *m, int token_id, float *hidden) {
     int H = CROM_HIDDEN_SIZE;
-    const float *embed = m->embed_f32;
-    for (int i = 0; i < H; i++)
-        hidden[i] = embed[(size_t)token_id * H + i] * m->embedding_multiplier;
+    const uint16_t *embed = m->embed_f16;
+    const uint16_t *src = embed + (size_t)token_id * H;
+    int i = 0;
+    for (; i + 7 < H; i += 8) {
+        __m128i f16 = _mm_loadu_si128((const __m128i *)(src + i));
+        __m256 f32 = _mm256_cvtph_ps(f16);
+        __m256 scaled = _mm256_mul_ps(f32, _mm256_set1_ps(m->embedding_multiplier));
+        _mm256_storeu_ps(hidden + i, scaled);
+    }
+    for (; i < H; i++) {
+        hidden[i] = _cvtsh_ss(src[i]) * m->embedding_multiplier;
+    }
     return 0;
 }
 
@@ -620,23 +627,24 @@ crom_embed(m, input_ids[position], hidden);
     float *final_norm_w = m->norms_f32 + (size_t)(m->num_layers * 2) * H;
     crom_rms_norm(final_norm_w, hidden, H, m->rms_norm_eps, work1);
 
-    /* lm_head tied */
+    /* lm_head tied (F16C: _mm256_cvtph_ps — carrega 8 uint16_t, converte 8 floats) */
     int vocab = CROM_VOCAB_SIZE;
-    const float *embed = m->embed_f32;
+    const uint16_t *embed = m->embed_f16;
 #pragma omp parallel for schedule(static)
     for (int v = 0; v < vocab; v++) {
         float s = 0.0f;
-        const float *ev = embed + (size_t)v * H;
+        const uint16_t *ev = embed + (size_t)v * H;
         const float *h = work1;
         int i = 0;
         for (; i + 7 < H; i += 8) {
-            __m256 e = _mm256_loadu_ps(ev + i);
+            __m128i f16 = _mm_loadu_si128((const __m128i *)(ev + i));
+            __m256 e = _mm256_cvtph_ps(f16);
             __m256 hh = _mm256_loadu_ps(h + i);
             __m256 p = _mm256_mul_ps(e, hh);
             const float *pf = (const float *)&p;
             s += pf[0] + pf[1] + pf[2] + pf[3] + pf[4] + pf[5] + pf[6] + pf[7];
         }
-        for (; i < H; i++) s += ev[i] * h[i];
+        for (; i < H; i++) s += _cvtsh_ss(ev[i]) * h[i];
         out_logits[v] = s / m->logits_scaling;
     }
     return 0;
@@ -647,10 +655,11 @@ crom_embed(m, input_ids[position], hidden);
 /* ------------------------------------------------------------------ */
 
 void crom_stats(const crom_model_t *m, long long *hits, long long *misses,
-                long long *bytes, double *io_ms) {
+                long long *bytes, long long *stream_bytes, double *io_ms) {
     if (hits) *hits = m->cache_hits;
     if (misses) *misses = m->cache_misses;
     if (bytes) *bytes = m->ssd_bytes_read;
+    if (stream_bytes) *stream_bytes = m->ssd_stream_bytes_read;
     if (io_ms) *io_ms = m->ssd_io_ms;
 }
 
@@ -659,7 +668,7 @@ void crom_model_close(crom_model_t *m) {
     free(m->expert_pool);
     free(m->dir);
     free(m->hot_base);
-    free(m->embed_f32);
+    /* m->embed_f16 aponta para dentro de hot_base — NÃO free() */
     free(m->norms_f32);
     free(m->routers_f32);
     free(m->inv_freq);

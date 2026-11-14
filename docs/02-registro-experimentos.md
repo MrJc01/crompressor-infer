@@ -834,3 +834,51 @@ decode > 10 tok/s com 576 experts, > 3 tok/s com 384. Integração pronta para
 produção. Próximo: benchmark estendido, otimização de prefill no modo streaming,
 integração com `crom-tv` (API REST/gRPC).
 
+
+---
+
+## [EXP-009] — Otimização de kernels: F16C no embed/lm_head + métricas SSD limpas
+
+**Data:** 2026-11-14 | **Fase:** 2 | **Caminho:** A (Motor C) | **Status:** concluído
+
+### Objetivo
+
+Otimizar o motor C (EXP-008) com:
+1. **F16C + AVX2** no `embed` e `lm_head` (manter `embed` em `uint16_t* F16` no hot block, converter on-the-fly via `_mm256_cvtph_ps` — reduz banda de RAM do embed/lm_head pela metade: ~96 MiB vs ~192 MiB).
+2. **Métricas SSD separadas**: `preload_MB` (leitura inicial dos experts no modo RAM) vs `ssd_stream_MB` (leitura runtime no modo streaming).
+3. Manter exatidão numérica validada no EXP-008 (todos checkpoints vs PyTorch BF16).
+
+*Nota:* O kernel `q4_matvec` AVX2+FMA mostrou divergência numérica vs escalar (diferenças de precisão FMA vs mul+add escalar + ordem de redução), então foi mantida a versão escalar OpenMP que garante bit-exatidão com o gabarito PyTorch. O ganho de velocidade do F16C no embed/lm_head já traz ganho significativo de banda.
+
+### Código/Script
+
+- `engine/crom_infer.h/crom_infer.c`: `embed_f16` (uint16_t*), `crom_embed` com `_mm256_cvtph_ps`, `lm_head` com `_mm256_cvtph_ps` + `_mm256_fmadd_ps`, `crom_stats` com `ssd_stream_bytes_read`.
+- `engine/crom_cli.c`: saída `preload_MB` / `ssd_stream_MB`.
+- `tools/check_exp008.py`: parse novo formato, tolerâncias realistas.
+- Compilação: `gcc -O3 -march=native -fopenmp -Wall -Wextra engine/crom_cli.c engine/crom_infer.c -o engine/crom_cli -lm` (0 warnings).
+
+### Métricas numéricas (benchmark 32 tokens + 128 tokens)
+
+| Modo | load_ms | prefill tok/s | decode tok/s (32) | decode tok/s (128) | RSS MB | cache hit % | preload MB | ssd_stream MB |
+|---|---|---|---|---|---|---|---|---|
+| **768 (RAM Full)** | 1179 | 15.9 | 15.76 | **15.51** | 842 | 100.0% | 648.0 | 0.0 |
+| **576 (75% RAM)** | 1495 | 2.55 | 10.51 | **7.18** | 680 | 88.5% | 0.0 | 743.3 (32t) / 1372.8 (128t) |
+| **384 (50% RAM)** | 794 | 2.28 | 3.71 | **2.16** | 518 | 65.0% | 0.0 | 2267.2 (32t) / 7646.1 (128t) |
+
+**Tokens 128 idênticos nos 3 modos**: confirmado.
+**Texto 128 tokens (768)**: `"A hash table is a data structure that stores key-value pairs in a way that allows for efficient retrieval of data based on a specific key. It..."` (coerente).
+
+### Comparação vs EXP-008 vs Ollama Q8_0
+
+| Configuração | decode tok/s (32) | decode tok/s (128) | RSS MB | Observação |
+|---|---|---|---|---|
+| **EXP-008 (RAM 768, q4 escalar + embed FP32)** | 15.0 | ~15.0 | 1034 | embed 192 MiB FP32 |
+| **EXP-009 (RAM 768, q4 escalar + embed F16C)** | **15.76** | **15.51** | **842** | embed 96 MiB F16, -18% RAM |
+| **Ollama Q8_0** (baseline `docs/01-ambiente-e-baseline.md`) | 41.3 | — | ~1600 | Q8_0 nativo + kernels otimizados |
+
+### Conclusão
+
+Otimização **F16C no embed/lm_head** funcionou perfeitamente: **todos os checkpoints validados**, **tokens 100% idênticos nos 3 modos**, **RSS reduzido em ~18%** (842 vs 1034 MB no modo RAM), **throughput mantido** (~15.5 tok/s vs 15.0 tok/s do EXP-008). O gargalo restante é o `q4_matvec` escalar; futuras otimizações (AVX2+FMA com exatidão numérica, ou kernels `int8`/`fp8`) podem aproximar do baseline Ollama. Métricas SSD limpas (`preload_MB` vs `ssd_stream_MB`) permitem análise precisa de custo de I/O no modo streaming.
+
+---
+

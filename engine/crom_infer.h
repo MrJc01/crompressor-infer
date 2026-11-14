@@ -84,7 +84,7 @@ typedef struct {
     void *hot_base;
     size_t hot_len;
 
-    float *embed_f32;
+    uint16_t *embed_f16;       /* embed F16 (tied lm_head) — ~96 MiB */
     float *norms_f32;
     float *routers_f32;
     float *inv_freq;
@@ -108,6 +108,7 @@ typedef struct {
     long long cache_hits;
     long long cache_misses;
     long long ssd_bytes_read;
+    long long ssd_stream_bytes_read;  /* apenas leitura runtime (streaming) */
     double ssd_io_ms;
 } crom_model_t;
 
@@ -131,6 +132,6 @@ int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
                          int *top8_out, float *top8_w_out);
 void crom_rms_norm(const float *w, const float *x, int n, float eps, float *out);
 void crom_stats(const crom_model_t *m, long long *hits, long long *misses,
-                long long *bytes, double *io_ms);
+                long long *bytes, long long *stream_bytes, double *io_ms);
 
 #endif /* CROM_INFER_H */
