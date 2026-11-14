@@ -5,6 +5,7 @@ crompressor/
 *.safetensors
 *.gguf
 *.crom*
+engine/crom_cli
 *.log
 *.o
 *.so
