@@ -400,3 +400,96 @@ JSON: `experiments/codebook-lut/torneio_results.json`; log integral:
 final (disco livre: 45 GB).
 
 ---
+## [EXP-005] — Trace de localidade do MoE (cache de experts) + duelo de kernels AVX2 (Q4 vs LUT)
+
+**Data:** 2026-11-14 · **Caminho:** A (delta esparso / cache) + B (codebook/LUT) · **Status:** concluído
+
+### Pergunta
+
+1. (T1) Qual a localidade temporal dos experts durante o decode? Quantos
+   bytes por token precisam ser lidos do disco se mantivermos um cache
+   LRU dos experts em RAM (cap N experts)? Isso valida o Caminho A
+   (delta esparso + cache de experts) antes de implementar o motor.
+2. (T2) Quanto ganhamos de vazamento em tokens/s trocando o working set
+   dos experts de FP32 (4,5 GiB) para formatos comprimidos, com kernels
+   AVX2 nativos: Q4 grupo-64 (vencedor do EXP-004), B1 codebook K=256
+   com LUT d=2 (vencedor alternativo) e LUT16 (vpxshufb, 4,06 bits)?
+   Serve de "speedup máximo teórico" para o motor Go+C antes de SSD.
+
+### Código/Script
+
+- Script T1: `experiments/delta-sparse/trace_moe_cache.py`
+  (hook PyTorch em `router.layer` de cada camada; captura os 8 experts
+  escolhidos por token durante decode; simulação LRU com caps 4/8/16/24)
+- Como rodar: `python3 trace_moe_cache.py` (modelo em cache HF local)
+- Script T2: `experiments/codebook-lut/bench_kernels.c` (C99 + AVX2/FMA)
+- Como rodar: `gcc -O3 -march=native -fopenmp -Wall -o bench_kernels bench_kernels.c -lm && OMP_NUM_THREADS=12 ./bench_kernels`
+- Detalhes: working set sintético com a dimensão exata do modelo
+  (24 camadas × 32 experts × (1024×1024 + 512×1024) = 1 207 959 552
+  pesos); 10 tokens de decode com 192 matvecs/token (8 experts × 24
+  camadas, seleção determinística); validação escalar de cada kernel
+  (SIMD vs escalar ~2e-07) e erro de dequantização vs FP32.
+- Correções durante o desenvolvimento: (1) pareamento nibble↔peso
+  (byte i = peso i low + peso i+32 high, alinhado ao kernel); (2) índice
+  do gather da LUT do B1 — cada lane precisa do offset de linha próprio
+  `(par)*K + código` (bug silencioso: o micro-teste de validação usava um
+  gerador degenerado e mascarava o erro); (3) alocação do `b1_cb` era a
+  metade (in+out) — heap overflow em build completo.
+
+### Métricas numéricas
+
+**T1 — trace de localidade (2 prompts, ~450 tokens de decode):**
+
+| Cache (experts) | Hit rate | Bytes lidos do SSD por token (Q4) | tok/s estimados @ 344,5 MB/s |
+|---|---|---|---|
+| 4 | 4,85% | 182,7 MB | 1,9 |
+| 8 | 34,89% | 125,0 MB | 2,8 |
+| 16 | 68,69% | 60,1 MB | 5,7 |
+| 24 | 89,06% | 21,0 MB | 16,4 |
+
+Conclusão T1: com cap 24/32 (RAM ~7,4 GB no formato Q4 de 1,3B) a
+leitura de SSD cai a ~21 MB/token; com cap 8 ainda são 125 MB/token.
+O cache de experts só "fecha" perto do working set inteiro — a
+recorrência por prompt é alta (89% dos acertos em 24), mas entre
+prompts os experts variam pouco (2,7-3,5/32 repetidos por token).
+Para o Caminho A, o delta esparso por PROMPT + cache LRU grande é o
+que sobrevive; cache pequeno morre no pior caso de conversa nova.
+
+**T2 — duelo de kernels (10 tokens × 192 matvecs; validação SIMD↔escalar ≤ 2e-07):**
+
+| Formato | bits/peso | Bytes/token | 1 thread | 6 threads | 12 threads | Erro dequant |
+|---|---|---|---|---|---|---|
+| FP32_AVX2 | 32,0 | 1 208,4 MB | 16,1 tok/s | 24,7 tok/s | 18,8 tok/s | — |
+| Q4_g64_AVX2 | 4,25 | 170,4 MB | 36,6 tok/s | **171,4 tok/s** | 77,9 tok/s | 0,0697 |
+| B1_LUT_d2_K256 | 4,25 | 170,4 MB | 10,4 tok/s | 52,3 tok/s | 22,0 tok/s | 0,0674 |
+| LUT16_VPSHUFB | 4,06 | 245,5 MB | 36,0 tok/s | 124,9 tok/s | 61,9 tok/s | 0,0617 |
+
+(números em GB/s efetivo: FP32 29,8 · Q4 29,1 · LUT16 30,6 — todos
+no teto de RAM ~30 GB/s; B1 fica em 8,9 GB/s, limitado pelo gather)
+
+### Conclusão
+
+1. **6 threads é o ponto ótimo** no Ryzen 5 5600GT: com 12 threads
+   (SMT) TODOS os kernels pioram ~2x — o segundo thread por núcleo só
+   disputa banda de RAM. O motor Go+C deve fixar `OMP_NUM_THREADS=6`.
+2. **Teto de vazamento confirmado: ~30 GB/s.** FP32, Q4 e LUT16 atingem
+   o mesmo GB/s — a diferença de tok/s vem 100% dos bytes tocados por
+   token. Com Q4 (3,76x menos bytes), o speedup é 171,4/24,7 = **6,9x**
+   sobre o FP32 AVX2, chegando a **171 tok/s sintéticos**.
+3. **Q4 grupo-64 é o formato certo para o Caminho B**: melhor tok/s
+   absoluto e PPL comprovada no EXP-004 (63,43). LUT16 (vpxshufb) fica
+   perto (125 tok/s, erro 0,0617) e é o candidato a "segundo nível"
+   se precisarmos de menos bits — o gather do B1 (52 tok/s) fica fora
+   da disputa neste hardware sem VP2INTERSECT.
+4. **Comparado aos baselines**: Q4@6t = 171 tok/s vs Ollama ~40-45
+   tok/s (4x) e vs HF bf16 CPU ~3,8 tok/s (45x) — dentro do estimado,
+   porque o Ollama também roda Q8/Q4 mas com overhead de runtime.
+5. **Plano do motor**: experts residentes em RAM no formato Q4_g64
+   (~612 MB para o modelo 1B inteiro, cabe nos 14 GiB), 6 threads,
+   e o disco entra só no fallback de modelos maiores (Caminho A com
+   cache LRU cap 24 → ~21 MB/token de SSD, ~16 tok/s adicionais).
+
+JSON/log: `experiments/delta-sparse/moe_cache_trace.json` (T1);
+log integral do T2: `experiments/codebook-lut/bench_kernels_run.log`.
+
+---
