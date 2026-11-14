@@ -667,3 +667,90 @@ baseline-hf/golden_ref_meta.json`. `.cromllm` fica fora do git
 (`artifacts/` no .gitignore).
 
 ---
+
+## [EXP-007B] — Auditoria matemática e alinhamento spec .cromllm com binario real
+
+**Data:** 2026-11-14 | **Fase:** 1 | **Caminho:** infra | **Status:** concluído
+
+### Objetivo
+
+Resolver, antes do motor C (EXP-008), todas as dúvidas/divergências entre o
+`tools/pack_cromllm.py`, o binario gravado `artifacts/granite-1b.cromllm`
+(829 468 672 B) e o `docs/03-formato-cromllm.md`: ordem real de
+`input_linear.chunk(2)`, `rope_theta`/`rope_scaling`/`inv_freq` do transformers
+instalado, offsets absolutos do bloco Hot e consistência do `hot_size` vs.
+leitura sequencial que o motor C fará.
+
+### Hipótese
+
+O binario ja esta consistente (header e cadeia de offsets encadeiam corretamente);
+so havia inconsistencias de documentacao (tamanho do embed, falta de tabela de
+offsets absolutos) e o `--golden` precisava de checkpoints intermediarios de
+camada para validar o motor C por camada.
+
+### Codigo/Script
+
+- `tools/pack_cromllm.py` (modo `--golden`): agora remove os
+  `register_forward_hook` apos o forward (`h.remove()`) e grava checkpoints do
+  ultimo token: `after_emb`, `after_L0_attn_resid`, `after_L0_moe_resid`,
+  `after_L23` (L2 norma e primeiros 6 floats, fp32).
+- `docs/03-formato-cromllm.md`: atualizado para espelhar 100% o binario.
+
+### Comparacao contra Ollama
+
+Nao aplicavel (auditoria de especificação/gabarito).
+
+### Metricas numericas
+
+**transformers instalado (site-packages/transformers/models/granitemoe/modeling_granitemoe.py):**
+- `GraniteMoeMoE.forward`: `hidden_states.chunk(2, dim=-1)`;
+  `hidden_states = self.activation(chunked_hidden_states[0]) * chunked_hidden_states[1]`.
+  => **primeira metade = gate (SiLU), segunda = up (linear)**; `silu(gate) * up`.
+  (Coerente com docs/03 e EXP-007; nao havia contradicao real na ordem.)
+- `hidden_act = silu`; `rope_theta = 1500000.0`; `rope_scaling = None`;
+  `rotary_emb` = `GraniteMoeRotaryEmbedding`; `inv_freq` len=32 (fp32).
+- `inv_freq[:4] = [1.0, 0.641205, 0.411144, 0.263628]`;
+  `inv_freq[-4:] = [4e-06, 3e-06, 2e-06, 1e-06]`.
+- `attention_multiplier = 0.015625`; `residual_multiplier = 0.22`;
+  `embedding_multiplier = 12.0`; `logits_scaling = 6.0`; `rms_norm_eps = 1e-06`.
+
+**artifacts/granite-1b.cromllm (header 144 B, lido diretamente do disco):**
+- `magic=CROMLM01`, `version=1`, `vocab=49155`, `hidden=1024`, `inter=512`,
+  `layers=24`, `heads=16`, `kv=8`, `experts=32`, `ept=8`, `head_dim=64`,
+  `group_size=64`, `rope_theta=1500000.0`.
+- Offsets (todos 4K-alinhados): `tok_offset=4096`, `hot_offset=3481600`,
+  `hot_size=146489344`, `expert_dir_offset=149970944`, `experts_offset=149991424`,
+  `tokenizer_offset=4096`, `tokenizer_size=3475806`.
+- Consistencia: `hot_offset + hot_size = 149970944 = expert_dir_offset` ✓;
+  `expert_dir_offset + 768*24 = 149989376` + pad 2048 = `experts_offset`
+  `149991424` (4K) ✓;
+  `experts_offset + 768*884736 = 829468672 = tamanho do arquivo` ✓.
+- **Nao houve bug de offset/calculo no `pack()`; nao foi necessario reempacotar.**
+
+**Correcao de documentacao em `docs/03-formato-cromllm.md`:**
+- Tamanho do embed estava errado (`100 661 760 B`); correto:
+  `49 155×1024×2 = 100 669 440 B`.
+- Incluida tabela exata de offsets absolutos de cada sub-bloco do Hot
+  (embed, norms, routers, inv_freq, attn) com padding de 4 KiB.
+- Confirmado: `inv_freq` ja presente; ordem `chunk(2)` = gate/up correta;
+  nao ha mencao a `Q8_0` no formato .cromllm.
+
+**--golden enriquecido:** `golden_ref.json` e
+`golden_ref_meta.json` agora contem `checkpoints` do ultimo token
+(token_index=7, token_id=44):
+- `after_emb`: l2=8.201982 first6=[-0.410156, 0.779297, 0.203613, -0.445312,
+  0.161865, 0.050537]
+- `after_L0_attn_resid`: l2=5.398649 first6=[-0.264062, 0.401406, 0.024375,
+  -0.258828, 0.105391, -0.062041]
+- `after_L0_moe_resid`: l2=3.447557 first6=[-0.068359, 0.037109, -0.050293,
+  -0.039062, -0.01123, -0.009521]
+- `after_L23`: l2=25.655025 first6=[0.109375, -0.400391, 0.079102, 1.3125,
+  0.648438, -0.640625]
+
+### Conclusão
+
+Binario `granite-1b.cromllm` e header 100% consistentes com a leitura sequencial
+do motor C (hot_size bate com offsets encadeados; arquivo fecha em 829 468 672 B).
+Nenhum reempacotamento necessário. Spec `docs/03-formato-cromllm.md` alinhada ao
+binario real. Gabarito `--golden` enriquecido com checkpoints por camada. Pronto
+para iniciar o motor C (EXP-008).

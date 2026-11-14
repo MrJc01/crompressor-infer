@@ -210,6 +210,16 @@ def pack():
     print("round-trip: 'OK' com erro esperado ~0.07 (Q4 dequant, EXP-006)")
 
 
+def _last_tok(t):
+    """ultimo token de um ativacao [1, seq, hidden] ou [seq, hidden]."""
+    return t[0, -1] if t.dim() == 3 else t[-1]
+
+
+def _norm6(t):
+    t = _last_tok(t).float()
+    return {"l2": float(t.norm()), "first6": [round(float(x), 6) for x in t[:6].tolist()]}
+
+
 def golden():
     torch.set_num_threads(6)
     tok = AutoTokenizer.from_pretrained(MODEL_ID, local_files_only=True)
@@ -222,14 +232,51 @@ def golden():
     print(f"frase: {GOLDEN_TEXT!r}")
     print(f"input_ids ({len(ids)}): {ids}")
 
+    ckpt = {}
+    hooks = []
+
+    def save_post(name):
+        def hook(_m, _inp, out):
+            t = out[0] if isinstance(out, (tuple, list)) else out
+            ckpt[name] = t.detach().clone().float()
+        return hook
+
+    def save_pre(name):
+        def hook(_m, args):
+            t = args[0] if isinstance(args, (tuple, list)) and len(args) > 0 else args
+            ckpt[name] = t.detach().clone().float()
+        return hook
+
+    # after_emb: saida do embed_tokens * embedding_multiplier (modelo aplica *12.0 apos a camada)
+    def hook_emb(_m, _inp, out):
+        ckpt["after_emb"] = (out.detach().clone().float() * float(model.config.embedding_multiplier))
+    hooks.append(model.model.embed_tokens.register_forward_hook(hook_emb))
+
+    # after_L0_attn_resid: layer0_input + self_attn_out * residual_multiplier  (linha 574 da camada)
+    hooks.append(model.model.layers[0].register_forward_pre_hook(save_pre("layer0_input")))
+    hooks.append(model.model.layers[0].self_attn.register_forward_hook(save_post("attn0_out")))
+
+    # after_L0_moe_resid: saida completa da camada 0 (apos MoE + residuo)
+    hooks.append(model.model.layers[0].register_forward_hook(save_post("l0_out")))
+
+    # after_L23: saida da camada 23, ANTES da final_norm
+    hooks.append(model.model.layers[23].register_forward_hook(save_post("l23_out")))
+
+    # roteamento (mantido do EXP-007), com hooks removidos ao fim
     routing = {}
     for li in (0, 23):
         router = model.model.layers[li].block_sparse_moe.router.layer
         def hook(_m, _inp, out, li=li):
             routing[li] = out.detach()
-        h = router.register_forward_hook(hook)
+        hooks.append(router.register_forward_hook(hook))
+
     with torch.no_grad():
         out = model(**enc)
+
+    # remove TODOS os hooks apos o forward
+    for h in hooks:
+        h.remove()
+
     logits = out.logits[0, -1].float()          # ja dividido por logits_scaling=6.0
     vals, tids = logits.topk(10)
     nxt = int(tids[0])
@@ -251,9 +298,29 @@ def golden():
         print(f"router L{li} (ultimo token): experts={rot[li]['expert_ids']}")
         print(f"             pesos(softmax top-8)={rot[li]['weights']}")
 
+    last_idx = len(ids) - 1
+    last_tok_id = ids[last_idx]
+    after_L0_attn_resid = (ckpt["layer0_input"]
+                           + ckpt["attn0_out"] * float(model.config.residual_multiplier))
+    checkpoints = {
+        "token_index": last_idx,
+        "token_id": last_tok_id,
+        "after_emb": _norm6(ckpt["after_emb"]),
+        "after_L0_attn_resid": _norm6(after_L0_attn_resid),
+        "after_L0_moe_resid": _norm6(ckpt["l0_out"]),
+        "after_L23": _norm6(ckpt["l23_out"]),
+    }
+    print("checkpoints (ultimo token, fp32):")
+    for k, v in checkpoints.items():
+        if k in ("token_index", "token_id"):
+            print(f"  {k}: {v}")
+        else:
+            print(f"  {k}: l2={v['l2']:.6f} first6={v['first6']}")
+
     ref = {"model_id": MODEL_ID, "text": GOLDEN_TEXT, "input_ids": ids,
            "routing": {str(k): v for k, v in rot.items()},
-           "top10_logits": top10, "next_token": {"id": nxt, "token": nxt_txt}}
+           "top10_logits": top10, "next_token": {"id": nxt, "token": nxt_txt},
+           "checkpoints": checkpoints}
     os.makedirs("artifacts", exist_ok=True)
     with open(GOLDEN, "w", encoding="utf-8") as f:
         json.dump(ref, f, ensure_ascii=False, indent=2)
@@ -262,7 +329,8 @@ def golden():
             "routing_l0": rot[0], "routing_l23": rot[23],
             "top10_ids": [t["id"] for t in top10],
             "top10_logits": [round(t["logit"], 4) for t in top10],
-            "next_token": {"id": nxt, "token": nxt_txt}}
+            "next_token": {"id": nxt, "token": nxt_txt},
+            "checkpoints": checkpoints}
     with open(GOLDEN_META, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print(f"salvo: {GOLDEN} + {GOLDEN_META}")

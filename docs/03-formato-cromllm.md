@@ -54,17 +54,28 @@
 
 ## 3. Bloco Hot (ordem fixa, cada sub-seção alinhada a 4 KiB)
 
-| Sub-seção | Conteúdo | Formato | Tamanho (granite-1b) |
-|---|---|---|---|
-| `embed_tokens` | embedding (pesos do lm_head **tied** — reuse para o logits) | F16 | 49 155×1024×2 = 100 661 760 B |
-| `norms` | 24× `input_layernorm` + 24× `post_attention_layernorm` + `final norm` (nesta ordem: L0.in, L0.post, L1.in, …, L23.post, final) | FP32 | 49×1024×4 = 200 704 B |
-| `routers` | `router.layer.weight` de cada camada L0..L23, linha a linha | FP32 | 24×32×1024×4 = 3 145 728 B |
-| `rotary_inv_freq` | `rotary_emb.inv_freq` (32 valores = head_dim/2) | FP32 | 128 B |
-| `attn` | por camada L0..L23, nesta ordem: `q_proj`, `k_proj`, `v_proj`, `o_proj` | Q4_G64 | 1 769 472 B/camada → 42 467 328 B |
+O bloco Hot começa em `hot_offset` (header) e ocupa exatamente `hot_size`
+bytes. Cada sub-seção é gravada com `section()` que faz `pad` a 4 KiB após o
+payload, então o **offset absoluto** de cada sub-seção inclui o padding do
+sub-bloco anterior. Tabela exata para `granite-1b.cromllm` (829 468 672 B):
+
+| # | Sub-seção | Offset absoluto | Formato | Payload (B) | Padding p/ 4K (B) | Próximo offset (B) |
+|---|------|---|---|---|---|---|
+| 0 | `embed_tokens` (embed F16, tied lm_head) | `hot_offset` = **3 481 600** | F16 | 49 155×1024×2 = **100 669 440** | 2 048 | 104 153 088 |
+| 1 | `norms` (L0.in, L0.post, …, L23.post, final) | **104 153 088** | FP32 | 49×1024×4 = **200 704** | 0 | 104 353 792 |
+| 2 | `routers` (router.layer.weight L0..L23) | **104 353 792** | FP32 | 24×32×1024×4 = **3 145 728** | 0 | 107 499 520 |
+| 3 | `rotary_inv_freq` (inv_freq, 32=f32) | **107 499 520** | FP32 | 32×4 = **128** | 3 968 | 107 503 616 |
+| 4 | `attn` (24 camadas: q,k,v,o Q4_G64) | `attn_off0` = **107 503 616** | Q4_G64 | 24×1 769 472 = **42 467 328** | 0 | 149 970 944 |
+
+- `hot_size` = 149 970 944 − 3 481 600 = **146 489 344 B** (inclui os 6 016 B de padding entre sub-blocos).
+- `hot_offset + hot_size = 149 970 944 = expert_dir_offset` (fecha o Hot em 4 KiB).
+- Cada camada de atenção = `q(589 824) + k(294 912) + v(294 912) + o(589 824) = 1 769 472 B`, já múltiplo de 4 KiB, sem padding intra-camada.
 
 Notas de atenção: `k_proj`/`v_proj` têm 512 linhas (8 KV heads × 64); RoPE é
-**split-half** (`rotate_half`: `cat(-x2, x1)`); o multiplicador
-`attention_multiplier` aplica-se PÓS-`q@k.T` (não em q); softmax em fp32.
+**split-half** (`rotate_half`: `cat(-x2, x1)`), `rope_theta = 1 500 000`,
+`rope_scaling = null`; o multiplicador `attention_multiplier = 0.015625`
+aplica-se PÓS-`q@k.T` (não em q); softmax em fp32; GQA 16 Q-heads / 8 KV-heads
+(repeat_kv ×2).
 
 ## 4. Tokenizador
 
