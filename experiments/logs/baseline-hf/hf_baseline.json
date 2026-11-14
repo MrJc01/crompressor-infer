@@ -1,0 +1,625 @@
+{
+  "model_id": "ibm-granite/granite-3.1-1b-a400m-instruct",
+  "threads": 12,
+  "xray_params": {
+    "buckets": {
+      "embeddings_lm_head": 50334720,
+      "attention_norms": 75547648,
+      "routers_gates": 786432,
+      "experts_moe": 1207959552,
+      "outros": 0
+    },
+    "total": 1334628352
+  },
+  "xray_similaridade": {
+    "por_camada": {
+      "L0.input_linear": {
+        "std_W": 0.017315136268734932,
+        "std_Delta": 0.01701846905052662,
+        "razao_std_W/std_Delta": 1.0174320743732899,
+        "cosseno_medio_expert_Base": 0.18415415287017822,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.2175,
+          "|Delta|<0.5*std": 0.41598,
+          "|Delta|<1.0*std": 0.71409
+        }
+      },
+      "L0.output_linear": {
+        "std_W": 0.018008286133408546,
+        "std_Delta": 0.01772363856434822,
+        "razao_std_W/std_Delta": 1.016060334791125,
+        "cosseno_medio_expert_Base": 0.17704838514328003,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20863,
+          "|Delta|<0.5*std": 0.39983,
+          "|Delta|<1.0*std": 0.69509
+        }
+      },
+      "L1.input_linear": {
+        "std_W": 0.01611132174730301,
+        "std_Delta": 0.015833884477615356,
+        "razao_std_W/std_Delta": 1.0175217439586521,
+        "cosseno_medio_expert_Base": 0.1847047060728073,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.23427,
+          "|Delta|<0.5*std": 0.43314,
+          "|Delta|<1.0*std": 0.71798
+        }
+      },
+      "L1.output_linear": {
+        "std_W": 0.01846500113606453,
+        "std_Delta": 0.01817493699491024,
+        "razao_std_W/std_Delta": 1.015959567905821,
+        "cosseno_medio_expert_Base": 0.17515623569488525,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21166,
+          "|Delta|<0.5*std": 0.40673,
+          "|Delta|<1.0*std": 0.70674
+        }
+      },
+      "L2.input_linear": {
+        "std_W": 0.01573139801621437,
+        "std_Delta": 0.015450971201062202,
+        "razao_std_W/std_Delta": 1.018149462030768,
+        "cosseno_medio_expert_Base": 0.18792179226875305,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21456,
+          "|Delta|<0.5*std": 0.40924,
+          "|Delta|<1.0*std": 0.70247
+        }
+      },
+      "L2.output_linear": {
+        "std_W": 0.017238551750779152,
+        "std_Delta": 0.01696695201098919,
+        "razao_std_W/std_Delta": 1.0160075739952616,
+        "cosseno_medio_expert_Base": 0.17644961178302765,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20717,
+          "|Delta|<0.5*std": 0.39927,
+          "|Delta|<1.0*std": 0.69819
+        }
+      },
+      "L3.input_linear": {
+        "std_W": 0.015653524547815323,
+        "std_Delta": 0.015375329181551933,
+        "razao_std_W/std_Delta": 1.018093620174141,
+        "cosseno_medio_expert_Base": 0.1876574605703354,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21083,
+          "|Delta|<0.5*std": 0.40465,
+          "|Delta|<1.0*std": 0.70138
+        }
+      },
+      "L3.output_linear": {
+        "std_W": 0.016814470291137695,
+        "std_Delta": 0.016549959778785706,
+        "razao_std_W/std_Delta": 1.0159825471413562,
+        "cosseno_medio_expert_Base": 0.17654937505722046,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20668,
+          "|Delta|<0.5*std": 0.39845,
+          "|Delta|<1.0*std": 0.69796
+        }
+      },
+      "L4.input_linear": {
+        "std_W": 0.015668289735913277,
+        "std_Delta": 0.015383264049887657,
+        "razao_std_W/std_Delta": 1.0185282970571972,
+        "cosseno_medio_expert_Base": 0.18975672125816345,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20806,
+          "|Delta|<0.5*std": 0.40038,
+          "|Delta|<1.0*std": 0.69869
+        }
+      },
+      "L4.output_linear": {
+        "std_W": 0.016421020030975342,
+        "std_Delta": 0.016163241118192673,
+        "razao_std_W/std_Delta": 1.0159484667027905,
+        "cosseno_medio_expert_Base": 0.1764509081840515,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20707,
+          "|Delta|<0.5*std": 0.39896,
+          "|Delta|<1.0*std": 0.69868
+        }
+      },
+      "L5.input_linear": {
+        "std_W": 0.015206659212708473,
+        "std_Delta": 0.014951215125620365,
+        "razao_std_W/std_Delta": 1.0170851723382923,
+        "cosseno_medio_expert_Base": 0.18245770037174225,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20407,
+          "|Delta|<0.5*std": 0.39379,
+          "|Delta|<1.0*std": 0.69242
+        }
+      },
+      "L5.output_linear": {
+        "std_W": 0.015998080372810364,
+        "std_Delta": 0.015745261684060097,
+        "razao_std_W/std_Delta": 1.0160568108567043,
+        "cosseno_medio_expert_Base": 0.17703931033611298,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20323,
+          "|Delta|<0.5*std": 0.39224,
+          "|Delta|<1.0*std": 0.69117
+        }
+      },
+      "L6.input_linear": {
+        "std_W": 0.015394906513392925,
+        "std_Delta": 0.015125315636396408,
+        "razao_std_W/std_Delta": 1.017823818257901,
+        "cosseno_medio_expert_Base": 0.18621249496936798,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20636,
+          "|Delta|<0.5*std": 0.39765,
+          "|Delta|<1.0*std": 0.69556
+        }
+      },
+      "L6.output_linear": {
+        "std_W": 0.01611563190817833,
+        "std_Delta": 0.01586262509226799,
+        "razao_std_W/std_Delta": 1.0159498704936085,
+        "cosseno_medio_expert_Base": 0.17644020915031433,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20431,
+          "|Delta|<0.5*std": 0.39419,
+          "|Delta|<1.0*std": 0.69334
+        }
+      },
+      "L7.input_linear": {
+        "std_W": 0.015625739470124245,
+        "std_Delta": 0.015326431952416897,
+        "razao_std_W/std_Delta": 1.0195288452417752,
+        "cosseno_medio_expert_Base": 0.19453081488609314,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21004,
+          "|Delta|<0.5*std": 0.4036,
+          "|Delta|<1.0*std": 0.70121
+        }
+      },
+      "L7.output_linear": {
+        "std_W": 0.016260050237178802,
+        "std_Delta": 0.01600322686135769,
+        "razao_std_W/std_Delta": 1.0160482244016207,
+        "cosseno_medio_expert_Base": 0.1770026981830597,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20633,
+          "|Delta|<0.5*std": 0.39767,
+          "|Delta|<1.0*std": 0.69648
+        }
+      },
+      "L8.input_linear": {
+        "std_W": 0.015709463506937027,
+        "std_Delta": 0.015405682846903801,
+        "razao_std_W/std_Delta": 1.019718740353939,
+        "cosseno_medio_expert_Base": 0.19551315903663635,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20837,
+          "|Delta|<0.5*std": 0.40077,
+          "|Delta|<1.0*std": 0.69857
+        }
+      },
+      "L8.output_linear": {
+        "std_W": 0.01629929058253765,
+        "std_Delta": 0.016042811796069145,
+        "razao_std_W/std_Delta": 1.015987146750132,
+        "cosseno_medio_expert_Base": 0.1766704022884369,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20668,
+          "|Delta|<0.5*std": 0.39806,
+          "|Delta|<1.0*std": 0.69641
+        }
+      },
+      "L9.input_linear": {
+        "std_W": 0.01561057660728693,
+        "std_Delta": 0.015337183140218258,
+        "razao_std_W/std_Delta": 1.0178255331874966,
+        "cosseno_medio_expert_Base": 0.1862289011478424,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20678,
+          "|Delta|<0.5*std": 0.39839,
+          "|Delta|<1.0*std": 0.69665
+        }
+      },
+      "L9.output_linear": {
+        "std_W": 0.016430066898465157,
+        "std_Delta": 0.01617087423801422,
+        "razao_std_W/std_Delta": 1.0160283641215655,
+        "cosseno_medio_expert_Base": 0.1768893599510193,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20603,
+          "|Delta|<0.5*std": 0.39709,
+          "|Delta|<1.0*std": 0.69521
+        }
+      },
+      "L10.input_linear": {
+        "std_W": 0.01561490073800087,
+        "std_Delta": 0.015346427448093891,
+        "razao_std_W/std_Delta": 1.0174941881955937,
+        "cosseno_medio_expert_Base": 0.18456020951271057,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20853,
+          "|Delta|<0.5*std": 0.40107,
+          "|Delta|<1.0*std": 0.6989
+        }
+      },
+      "L10.output_linear": {
+        "std_W": 0.01648096553981304,
+        "std_Delta": 0.016220061108469963,
+        "razao_std_W/std_Delta": 1.0160852927494113,
+        "cosseno_medio_expert_Base": 0.17716512084007263,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20745,
+          "|Delta|<0.5*std": 0.39939,
+          "|Delta|<1.0*std": 0.69715
+        }
+      },
+      "L11.input_linear": {
+        "std_W": 0.015571795403957367,
+        "std_Delta": 0.015308341011404991,
+        "razao_std_W/std_Delta": 1.0172098591451613,
+        "cosseno_medio_expert_Base": 0.18306401371955872,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20908,
+          "|Delta|<0.5*std": 0.40199,
+          "|Delta|<1.0*std": 0.7
+        }
+      },
+      "L11.output_linear": {
+        "std_W": 0.016611095517873764,
+        "std_Delta": 0.01635007932782173,
+        "razao_std_W/std_Delta": 1.0159642155134918,
+        "cosseno_medio_expert_Base": 0.17651525139808655,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20934,
+          "|Delta|<0.5*std": 0.40204,
+          "|Delta|<1.0*std": 0.69821
+        }
+      },
+      "L12.input_linear": {
+        "std_W": 0.01565311849117279,
+        "std_Delta": 0.015391367487609386,
+        "razao_std_W/std_Delta": 1.017006351370281,
+        "cosseno_medio_expert_Base": 0.18190208077430725,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21156,
+          "|Delta|<0.5*std": 0.40538,
+          "|Delta|<1.0*std": 0.70171
+        }
+      },
+      "L12.output_linear": {
+        "std_W": 0.016764845699071884,
+        "std_Delta": 0.016500679776072502,
+        "razao_std_W/std_Delta": 1.016009396375442,
+        "cosseno_medio_expert_Base": 0.17669358849525452,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21111,
+          "|Delta|<0.5*std": 0.40436,
+          "|Delta|<1.0*std": 0.69972
+        }
+      },
+      "L13.input_linear": {
+        "std_W": 0.015714816749095917,
+        "std_Delta": 0.015446613542735577,
+        "razao_std_W/std_Delta": 1.0173632366484933,
+        "cosseno_medio_expert_Base": 0.18372899293899536,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21226,
+          "|Delta|<0.5*std": 0.40699,
+          "|Delta|<1.0*std": 0.70369
+        }
+      },
+      "L13.output_linear": {
+        "std_W": 0.0168598685413599,
+        "std_Delta": 0.016594354063272476,
+        "razao_std_W/std_Delta": 1.0160002900429295,
+        "cosseno_medio_expert_Base": 0.17668096721172333,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21168,
+          "|Delta|<0.5*std": 0.40549,
+          "|Delta|<1.0*std": 0.70064
+        }
+      },
+      "L14.input_linear": {
+        "std_W": 0.01568741537630558,
+        "std_Delta": 0.015420044772326946,
+        "razao_std_W/std_Delta": 1.0173391587330836,
+        "cosseno_medio_expert_Base": 0.18355053663253784,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21442,
+          "|Delta|<0.5*std": 0.41055,
+          "|Delta|<1.0*std": 0.70727
+        }
+      },
+      "L14.output_linear": {
+        "std_W": 0.016808999702334404,
+        "std_Delta": 0.016545390710234642,
+        "razao_std_W/std_Delta": 1.0159324730806567,
+        "cosseno_medio_expert_Base": 0.1763055920600891,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21426,
+          "|Delta|<0.5*std": 0.40915,
+          "|Delta|<1.0*std": 0.70342
+        }
+      },
+      "L15.input_linear": {
+        "std_W": 0.015674632042646408,
+        "std_Delta": 0.015416489914059639,
+        "razao_std_W/std_Delta": 1.016744546263501,
+        "cosseno_medio_expert_Base": 0.18047863245010376,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21518,
+          "|Delta|<0.5*std": 0.41162,
+          "|Delta|<1.0*std": 0.70714
+        }
+      },
+      "L15.output_linear": {
+        "std_W": 0.016958465799689293,
+        "std_Delta": 0.016691599041223526,
+        "razao_std_W/std_Delta": 1.0159880882476677,
+        "cosseno_medio_expert_Base": 0.1765626221895218,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21385,
+          "|Delta|<0.5*std": 0.40865,
+          "|Delta|<1.0*std": 0.7029
+        }
+      },
+      "L16.input_linear": {
+        "std_W": 0.01571161486208439,
+        "std_Delta": 0.015446794219315052,
+        "razao_std_W/std_Delta": 1.017144051963753,
+        "cosseno_medio_expert_Base": 0.182493656873703,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21351,
+          "|Delta|<0.5*std": 0.40884,
+          "|Delta|<1.0*std": 0.70513
+        }
+      },
+      "L16.output_linear": {
+        "std_W": 0.017110221087932587,
+        "std_Delta": 0.016840536147356033,
+        "razao_std_W/std_Delta": 1.0160140353143623,
+        "cosseno_medio_expert_Base": 0.1767643541097641,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20964,
+          "|Delta|<0.5*std": 0.40255,
+          "|Delta|<1.0*std": 0.69918
+        }
+      },
+      "L17.input_linear": {
+        "std_W": 0.015784716233611107,
+        "std_Delta": 0.01551340613514185,
+        "razao_std_W/std_Delta": 1.0174887510908819,
+        "cosseno_medio_expert_Base": 0.18439728021621704,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21247,
+          "|Delta|<0.5*std": 0.40744,
+          "|Delta|<1.0*std": 0.70448
+        }
+      },
+      "L17.output_linear": {
+        "std_W": 0.017463983967900276,
+        "std_Delta": 0.01718955859541893,
+        "razao_std_W/std_Delta": 1.0159646549943686,
+        "cosseno_medio_expert_Base": 0.17651952803134918,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20841,
+          "|Delta|<0.5*std": 0.40069,
+          "|Delta|<1.0*std": 0.69741
+        }
+      },
+      "L18.input_linear": {
+        "std_W": 0.01585722714662552,
+        "std_Delta": 0.015581393614411354,
+        "razao_std_W/std_Delta": 1.017702751052964,
+        "cosseno_medio_expert_Base": 0.18548880517482758,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21102,
+          "|Delta|<0.5*std": 0.40511,
+          "|Delta|<1.0*std": 0.70267
+        }
+      },
+      "L18.output_linear": {
+        "std_W": 0.017735866829752922,
+        "std_Delta": 0.01745605655014515,
+        "razao_std_W/std_Delta": 1.0160294095521503,
+        "cosseno_medio_expert_Base": 0.1768195927143097,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.2088,
+          "|Delta|<0.5*std": 0.40123,
+          "|Delta|<1.0*std": 0.69764
+        }
+      },
+      "L19.input_linear": {
+        "std_W": 0.015886569395661354,
+        "std_Delta": 0.015610196627676487,
+        "razao_std_W/std_Delta": 1.0177046307984914,
+        "cosseno_medio_expert_Base": 0.1855185627937317,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20878,
+          "|Delta|<0.5*std": 0.4013,
+          "|Delta|<1.0*std": 0.69908
+        }
+      },
+      "L19.output_linear": {
+        "std_W": 0.017968175932765007,
+        "std_Delta": 0.01768581010401249,
+        "razao_std_W/std_Delta": 1.0159656711845195,
+        "cosseno_medio_expert_Base": 0.17648041248321533,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20779,
+          "|Delta|<0.5*std": 0.39962,
+          "|Delta|<1.0*std": 0.69656
+        }
+      },
+      "L20.input_linear": {
+        "std_W": 0.015940308570861816,
+        "std_Delta": 0.015654394403100014,
+        "razao_std_W/std_Delta": 1.0182641474591432,
+        "cosseno_medio_expert_Base": 0.18840286135673523,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20702,
+          "|Delta|<0.5*std": 0.39863,
+          "|Delta|<1.0*std": 0.69714
+        }
+      },
+      "L20.output_linear": {
+        "std_W": 0.018040157854557037,
+        "std_Delta": 0.01775668002665043,
+        "razao_std_W/std_Delta": 1.0159645737537166,
+        "cosseno_medio_expert_Base": 0.17650650441646576,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20578,
+          "|Delta|<0.5*std": 0.3965,
+          "|Delta|<1.0*std": 0.69411
+        }
+      },
+      "L21.input_linear": {
+        "std_W": 0.016001693904399872,
+        "std_Delta": 0.01570434682071209,
+        "razao_std_W/std_Delta": 1.0189340624657892,
+        "cosseno_medio_expert_Base": 0.19171880185604095,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20525,
+          "|Delta|<0.5*std": 0.39562,
+          "|Delta|<1.0*std": 0.69411
+        }
+      },
+      "L21.output_linear": {
+        "std_W": 0.01810416206717491,
+        "std_Delta": 0.017818797379732132,
+        "razao_std_W/std_Delta": 1.016014811850735,
+        "cosseno_medio_expert_Base": 0.17681090533733368,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20411,
+          "|Delta|<0.5*std": 0.39364,
+          "|Delta|<1.0*std": 0.69191
+        }
+      },
+      "L22.input_linear": {
+        "std_W": 0.016037413850426674,
+        "std_Delta": 0.015756163746118546,
+        "razao_std_W/std_Delta": 1.0178501638368294,
+        "cosseno_medio_expert_Base": 0.1863020956516266,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20445,
+          "|Delta|<0.5*std": 0.3944,
+          "|Delta|<1.0*std": 0.69294
+        }
+      },
+      "L22.output_linear": {
+        "std_W": 0.018056316301226616,
+        "std_Delta": 0.01777203381061554,
+        "razao_std_W/std_Delta": 1.0159960583937935,
+        "cosseno_medio_expert_Base": 0.1766822636127472,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20294,
+          "|Delta|<0.5*std": 0.39189,
+          "|Delta|<1.0*std": 0.69041
+        }
+      },
+      "L23.input_linear": {
+        "std_W": 0.016362395137548447,
+        "std_Delta": 0.016086271032691002,
+        "razao_std_W/std_Delta": 1.0171652028177505,
+        "cosseno_medio_expert_Base": 0.1822660267353058,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21,
+          "|Delta|<0.5*std": 0.40357,
+          "|Delta|<1.0*std": 0.70247
+        }
+      },
+      "L23.output_linear": {
+        "std_W": 0.017549077048897743,
+        "std_Delta": 0.01727224327623844,
+        "razao_std_W/std_Delta": 1.0160276675259747,
+        "cosseno_medio_expert_Base": 0.1764940619468689,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20783,
+          "|Delta|<0.5*std": 0.39984,
+          "|Delta|<1.0*std": 0.69773
+        }
+      }
+    },
+    "media_global": {
+      "input_linear": {
+        "std_W": 0.015813568063701194,
+        "std_Delta": 0.015537083226566514,
+        "razao_std_W/std_Delta": 1.0177966003672987,
+        "cosseno_medio_expert_Base": 0.18595876917243004,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.21101447691520056,
+          "|Delta|<0.5*std": 0.40458767861127853,
+          "|Delta|<1.0*std": 0.7014896819988886
+        }
+      },
+      "output_linear": {
+        "std_W": 0.017106777134661872,
+        "std_Delta": 0.01683739200234413,
+        "razao_std_W/std_Delta": 1.0159993977391337,
+        "cosseno_medio_expert_Base": 0.17661238585909209,
+        "esparsidade_Delta": {
+          "|Delta|<0.25*std": 0.20794892062743506,
+          "|Delta|<0.5*std": 0.39989689985911053,
+          "|Delta|<1.0*std": 0.6973438560962677
+        }
+      }
+    },
+    "n_camadas": 24
+  },
+  "codebook_k256": {
+    "tensor": "block_sparse_moe.input_linear.weight",
+    "shape": [
+      32,
+      1024,
+      1024
+    ],
+    "d": 4,
+    "k": 256,
+    "amostra": 100000,
+    "erro_relativo_W_direto": 0.32228994369506836,
+    "erro_relativo_via_Delta": 0.31675076484680176,
+    "ganho": 1.0174875259399414
+  },
+  "perplexidade": {
+    "n_tokens": 141,
+    "nll": 4.034443378448486,
+    "ppl": 56.51145553588867
+  },
+  "prompts": [
+    {
+      "n": 1,
+      "prompt": "Explique em 3 frases curtas como funciona uma tabela hash.",
+      "response": "Uma tabela hash funciona criando um mapa de chaves-valor, onde cada chave é um valor único e cada valor é um valor de dados. Ela armazena dados em um array, onde cada posição representa um chave. Quando um novo valor é inserido, ele é convertido em um chave e acessado na tabela, e o valor armazenado é retornado. Se o chave já estiver presente, o valor é retornado diretamente, evitando a necessidade de uma busca manual. Isso torna a tabela hash muito",
+      "tokens_gerados": 128,
+      "tempo_s": 32.98439108800085,
+      "tok_s": 3.8806234033092153
+    },
+    {
+      "n": 2,
+      "prompt": "What is a Mixture-of-Experts neural network? Answer concisely in 3 sentences.",
+      "response": "A Mixture-of-Experts neural network is a type of deep learning architecture that combines the strengths of multiple expert models to make predictions. It consists of multiple expert networks, each specializing in a specific task, and a weighted average or voting mechanism to combine their outputs, resulting in a more accurate and robust prediction.",
+      "tokens_gerados": 68,
+      "tempo_s": 18.763058159995126,
+      "tok_s": 3.6241426861311647
+    },
+    {
+      "n": 3,
+      "prompt": "Escreva apenas uma função em C que soma dois vetores float de tamanho n. Sem texto extra.",
+      "response": "Aqui está uma função em C que soma dois vetores float de tamanho n:\n\n```c\n#include <stdio.h>\n\nvoid sumVectors(float *v1, float *v2, float *sum) {\n    *sum = 0.0;\n    for (int i = 0; i < 3; i++) {\n        *sum += v1[i] + v2[i];\n    }\n}\n\nint main() {\n    float v1[3] = {1.0, 2.0, 3.0};\n    float",
+      "tokens_gerados": 128,
+      "tempo_s": 32.04876599199633,
+      "tok_s": 3.9939135264042913
+    },
+    {
+      "n": 4,
+      "prompt": "Resolva passo a passo e dê o resultado final: Se um disco lê a 250 MB/s e cada especialista tem 10 MB, quantos milissegundos leva para ler 8 especialistas?",
+      "response": "Para resolver esse problema, vamos seguir os passos descritos na fórmula de leitura de discos:\n\n1. Primeiro, calculemos o tempo total necessário para ler 8 especialistas, cada com 10 MB de dados. Isso é 8 especialistas * 10 MB/specialista = 80 MB.\n2. Em seguida, convertemos o tempo em segundos, pois a leitura é baseada em MB/s. 1 MB é igual a 1024 KB,",
+      "tokens_gerados": 128,
+      "tempo_s": 34.08072186999925,
+      "tok_s": 3.7557889908627926
+    }
+  ],
+  "rss_pico_mb": 3482.15625
+}

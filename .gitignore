@@ -1,0 +1,17 @@
+crompressor/
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.gguf
+*.crom*
+*.log
+*.o
+*.so
+*.out
+experiments/io-ssd/bench_ssd
+experiments/codebook-lut/bench_kernels
+experiments/codebook-lut/bench_vpshufb
+__pycache__/
+.venv/
+venv/

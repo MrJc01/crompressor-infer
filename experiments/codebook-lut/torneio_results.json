@@ -1,0 +1,144 @@
+{
+  "model_id": "ibm-granite/granite-3.1-1b-a400m-instruct",
+  "ref_bf16": {
+    "nll": 4.034443378448486,
+    "ppl": 56.51145553588867
+  },
+  "variantes": {
+    "Q4_grupo64": {
+      "bits_peso": 4.25,
+      "mb_experts": 612.0,
+      "compressao_vs_bf16": 3.764705882352941,
+      "erro_l2": 0.11228492144107566,
+      "nll": 4.149924278259277,
+      "ppl": 63.429195404052734,
+      "delta_ppl_vs_bf16": 6.9177398681640625,
+      "tempo_s": 25.051951638997707
+    },
+    "B1_Codebook_d2_K256": {
+      "bits_peso": 4.250325520833333,
+      "mb_experts": 612.046875,
+      "compressao_vs_bf16": 3.764417553802558,
+      "erro_l2": 0.09165245796487062,
+      "nll": 4.171673774719238,
+      "ppl": 64.82386016845703,
+      "delta_ppl_vs_bf16": 8.31240463256836,
+      "tempo_s": 625.0822133460024
+    },
+    "B2_Codebook_d4_K256": {
+      "bits_peso": 2.2506510416666665,
+      "mb_experts": 324.09375,
+      "compressao_vs_bf16": 7.109054093144345,
+      "erro_l2": 0.317398945727301,
+      "nll": 6.162783145904541,
+      "ppl": 474.7475280761719,
+      "delta_ppl_vs_bf16": 418.2360725402832,
+      "tempo_s": 347.0854561360029
+    },
+    "C1_Hibrido_Codebook_DeltaEsparso": {
+      "bits_peso": 3.550651872323619,
+      "mb_experts": 511.29386961460114,
+      "compressao_vs_bf16": 4.506214795293145,
+      "erro_l2": 0.1751606553880008,
+      "nll": 4.331594467163086,
+      "ppl": 76.06547546386719,
+      "delta_ppl_vs_bf16": 19.554019927978516,
+      "tempo_s": 481.35967872799665
+    },
+    "C2_Hibrido_RVQ_d4_K256_K16": {
+      "bits_peso": 3.2506917317708335,
+      "mb_experts": 468.099609375,
+      "compressao_vs_bf16": 4.9220293156755,
+      "erro_l2": 0.18857248921100414,
+      "nll": 4.491787910461426,
+      "ppl": 89.28092956542969,
+      "delta_ppl_vs_bf16": 32.769474029541016,
+      "tempo_s": 383.7680127269996
+    },
+    "A_Esparso50_Q4": {
+      "bits_peso": 3.2452695932653217,
+      "mb_experts": 467.3188214302063,
+      "compressao_vs_bf16": 4.930252954393579,
+      "erro_l2": 0.2805409171258421,
+      "nll": 5.091803073883057,
+      "ppl": 162.68292236328125,
+      "delta_ppl_vs_bf16": 106.17146682739258,
+      "tempo_s": 33.678459392998775
+    }
+  },
+  "vencedores": [
+    "Q4_grupo64",
+    "B1_Codebook_d2_K256"
+  ],
+  "prompts_vencedores": {
+    "Q4_grupo64": [
+      {
+        "n": 1,
+        "prompt": "Explique em 3 frases curtas como funciona uma tabela hash.",
+        "response": "1. Um hash é uma função que transforma um input (ou \"hash key\") em um output (ou \"hash value\").\n2. A função é criptografada para proteger a segurança e garantir que o hash é único para cada input.\n3. Um hash é usado em diversos sistemas, incluindo criptografia, autenticação e criptografia de dados.",
+        "tokens": 88,
+        "tempo_s": 14.329478600004222,
+        "tok_s": 6.141186462986453
+      },
+      {
+        "n": 2,
+        "prompt": "What is a Mixture-of-Experts neural network? Answer concisely in 3 sentences.",
+        "response": "A Mixture-of-Experts (MoE) neural network is a type of deep learning architecture that combines multiple expert networks, each specializing in a specific task. It's designed to handle complex tasks with high-dimensional input data by aggregating diverse expert predictions, improving model generalization and performance.",
+        "tokens": 65,
+        "tempo_s": 11.110776624002028,
+        "tok_s": 5.850176112764602
+      },
+      {
+        "n": 3,
+        "prompt": "Escreva apenas uma função em C que soma dois vetores float de tamanho n. Sem texto extra.",
+        "response": "A função `sum_vectors` em C pode ser escrita como:\n\n```c\n#include <math.h>\n\nfloat sum_vectors(float *v1, float *v2, int n) {\n    float sum = 0.0;\n    for (int i = 0; i < n; i++) {\n        sum += v1[i] + v2[i];\n    }\n    return sum;\n}\n```\n\nEste função recebe dois pontos de vazamento `v1` e `v2` de tamanho n, onde n",
+        "tokens": 128,
+        "tempo_s": 21.703395945005468,
+        "tok_s": 5.897694550859273
+      },
+      {
+        "n": 4,
+        "prompt": "Resolva passo a passo e dê o resultado final: Se um disco lê a 250 MB/s e cada especialista tem 10 MB, quantos milissegundos leva para ler 8 especialistas?",
+        "response": "Para resolver esse problema, preciso calcular o tempo em segundos para ler 8 especialistas, que é 8 * 10^6 segundos. Em seguida, posso multiplicar esse tempo por 250 para obter o tempo em milissegundos.\n\nAqui está o passo a passo e o resultado final:\n\n1. Para ler 8 especialistas, o tempo em segundos é 8 * 10^6 segundos.\n2. Para converter esse tempo em milissegundos,",
+        "tokens": 128,
+        "tempo_s": 20.84456540699466,
+        "tok_s": 6.14068931161539
+      }
+    ],
+    "B1_Codebook_d2_K256": [
+      {
+        "n": 1,
+        "prompt": "Explique em 3 frases curtas como funciona uma tabela hash.",
+        "response": "Uma tabela hash é um algoritmo que cria uma hash de um input (ou \"hash\") em um número de bits. Esse número de bits é determinado pelo tamanho do input e é usado para organizar e recuperar dados. Aqui estão as etapas básicas:\n\n1. Divida o input em chunks de tamanho mínimo de bits.\n2. Calcule a hash de cada chunk, usando um algoritmo de hash, como MD5 ou SHA-256.\n3. Adicione o hash de cada chunk ao conjunto de hashes.\n4",
+        "tokens": 128,
+        "tempo_s": 19.138438262998534,
+        "tok_s": 6.688111027714832
+      },
+      {
+        "n": 2,
+        "prompt": "What is a Mixture-of-Experts neural network? Answer concisely in 3 sentences.",
+        "response": "A Mixture-of-Experts (MoE) neural network is a type of deep learning model that combines multiple expert models to make predictions. Each expert model specializes in a specific task, and the final output is a weighted sum of these expert outputs, where the weights are determined by a mixture distribution. This approach enhances model generalization and reduces overfitting.",
+        "tokens": 78,
+        "tempo_s": 9.821592551001231,
+        "tok_s": 7.941685586626024
+      },
+      {
+        "n": 3,
+        "prompt": "Escreva apenas uma função em C que soma dois vetores float de tamanho n. Sem texto extra.",
+        "response": "Aqui está uma função em C que soma dois vetores float de tamanho n:\n\n```c\n#include <stdio.h>\n\nfloat* addVectors(float* v1, float* v2, int n) {\n    float* result = (float*)malloc(n * sizeof(float));\n    for (int i = 0; i < n; i++) {\n        result[i] = v1[i] + v2[i];\n    }\n    return result;\n}\n\nint main() {\n    float v1[] = {1.0, 2",
+        "tokens": 128,
+        "tempo_s": 18.908404631998565,
+        "tok_s": 6.769476457225084
+      },
+      {
+        "n": 4,
+        "prompt": "Resolva passo a passo e dê o resultado final: Se um disco lê a 250 MB/s e cada especialista tem 10 MB, quantos milissegundos leva para ler 8 especialistas?",
+        "response": "Para resolver esse problema, vamos começar dividindo o tempo total em partes iguais.\n\nPrimeiro, vamos dividir o tempo total em 8 especialistas, pois cada especialista leva 10 MB/s. Isso nos dá:\n\n8 especialistas * 10 MB/s = 80 MB/s\n\nAgora, vamos dividir o tempo total em 80 MB/s, pois cada especialista leva 10 MB/s. Isso nos dá:",
+        "tokens": 128,
+        "tempo_s": 17.10065448700334,
+        "tok_s": 7.48509363178358
+      }
+    ]
+  },
+  "rss_pico_mb": 5638.1640625
+}
