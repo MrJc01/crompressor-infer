@@ -44,6 +44,8 @@ comparar contra uma linha desta tabela.
 | # | Modelo | Quantização | Tokens/s (geração) | Tokens/s (prompt eval) | RAM pico | Disco ocupado | Prompts padrão | Log de saída |
 |---|---|---|---|---|---|---|---|---|
 | 1 | granite3.1-moe:1b | (interna Ollama, ~1,4 GB em disco) | 39,5–45,0 (média ~41,3) | 501–695 | ~1,6 GiB RSS (`llama-server`) + 34 MB (`ollama serve`) | 1,4 GB | 4 prompts fixos (EXP-002) | `experiments/logs/baseline-ollama/baseline_results.json` |
+| 2 | **crom-infer Q4_g64 (RAM 768)** | Q4_g64 (idx u8 + scales f32, grupo 64), experts residentes | **47,8** (média 4 prompts) | **52,9** | **871 MB RSS** | **791 MiB** (`artifacts/granite-1b.cromllm`) | 4 prompts fixos (EXP-010) | `experiments/logs/crom-infer/duelo_ollama.json` |
+| 3 | **crom-infer Q4_g64 (SSD 576)** | Q4_g64 + streaming `O_DIRECT` (75% RAM, LRU) | **15,1** (média 4 prompts) | **8,9** | **709 MB RSS** (cache_hit **90,9%**, `ssd_stream` **2971,9 MB**) | **791 MiB** (`artifacts/granite-1b.cromllm`) | 4 prompts fixos (EXP-010) | `experiments/logs/crom-infer/duelo_ollama.json` |
 
 ### Protocolo sugerido do baseline
 

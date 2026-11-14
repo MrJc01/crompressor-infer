@@ -944,3 +944,101 @@ próximas otimizações.
 
 ---
 
+## [EXP-010] — CLI Go+CGO (LockOSThread + GC off) e tokenizador BPE nativo validado 100% vs HuggingFace
+
+**Data:** 2026-11-14 | **Fase:** 2 | **Caminho:** A (Motor C + wrapper Go) | **Status:** concluído
+
+### Objetivo
+
+Empacotar o motor C (`engine/libcrom_infer.a`, EXP-009B) num CLI Go via CGO
+(`cmd/crom-infer`, `internal/engine`, `internal/tokenizer`), com tokenizador BPE
+nativo em Go (sem dependências externas) e duelo oficial contra os baselines
+Ollama Q8_0 e PyTorch BF16 nos 4 prompts padrão do projeto.
+
+### Causa da lentidão (~0,35–1,15 tok/s) e correções
+
+Na primeira integração o binário Go caiu para ~100× mais lento que o
+`engine/crom_cli` (chegando a travar sob `timeout 15s`) e imprimia
+`attn_ms=0.0 moe_ms=0.0 lm_head_ms=0.0`. Diagnóstico:
+
+1. **Migração de OS thread + OpenMP:** o runtime Go movia a goroutine entre
+   threads `M` a cada chamada CGO. O libgomp associa o *time de workers* ao
+   *master thread*; trocando de master a cada `crom_forward`, o time era
+   reconstruído/contendido (medido: `LOCK=false` 18–38 tok/s vs `LOCK=true`
+   48–59 tok/s). Correção: **`runtime.LockOSThread()`** antes de qualquer
+   `crom_forward`.
+2. **GC do Go roubando núcleos:** após o parse do tokenizer (muitos mapas), o
+   GC disparava workers durante a inferência e derrubava runs para ~11 tok/s.
+   Como o heap Go é pequeno e limitado, a correção foi
+   **`debug.SetGCPercent(-1)`** (GC desligado durante a inferência).
+3. **Timers zerados:** `main.go` imprimia `0.0` literais; agora os valores vêm
+   de `crom_stats()` via `model.GetStats()` (`attn_ms`, `moe_ms`, `lm_head_ms`).
+
+Resultado: `./bin/crom-infer` estável em **~59 tok/s** (RAM 768), igual ao C puro.
+
+### Tokenizador BPE nativo
+
+`internal/tokenizer/tokenizer.go` reescrito para reproduzir o
+`GPT2TokenizerFast` do Granite:
+
+- split de `added_tokens`/`special_tokens` (`<|start_of_role|>`,
+  `<|end_of_role|>`, `<|end_of_text|>`, `<|tool_call|>`, …) **antes** do BPE;
+- tabela byte↔unicode do GPT-2 (`bytes_to_unicode`) correta;
+- pré-tokenização ByteLevel com a regex GPT-2, incluindo o lookahead
+  `\s+(?!\S)` (espaços à esquerda agrupados corretamente);
+- merges por rank (merge-all do par de menor rank);
+- `ApplyChatTemplate` fiel ao template Granite (system default com data
+  dinâmica + `add_generation_prompt`);
+- `eos_token_id` real = **0** (`<|end_of_text|>`), derivado do
+  `added_tokens_decoder`.
+
+Validação: `tools/check_tokenizer.py` compara `ids_go == ids_hf` para o prompt
+cru e os 4 prompts com chat template — **`ALL MATCH`** (100%).
+
+### Código/Script
+
+- `Makefile`: build do `engine/libcrom_infer.a` (C, `-O3 -march=native
+  -fopenmp`) + `go build` do `bin/crom-infer`.
+- `cmd/crom-infer/main.go`: CLI com `--prompt`, `--chat`, `--max-tokens`,
+  `--threads`, `--cache-experts`, `--stream`, `--json`, `--tokenize-only`;
+  `LockOSThread()` + `SetGCPercent(-1)`; prefill/decode com KV-cache.
+- `internal/engine/engine.go`: CGO wrapper + `ReadTokenizerData()` (lê o
+  tokenizer.json direto do header `.cromllm`, sem carregar pesos).
+- `internal/tokenizer/tokenizer.go`: BPE/ByteLevel/added-tokens nativo.
+- `tools/check_tokenizer.py`: validação Go vs HuggingFace.
+- `tools/duelo_ollama.py`: duelo oficial (4 prompts, RAM 768 e SSD 576).
+- Saída: `experiments/logs/crom-infer/duelo_ollama.json`.
+
+### Duelo oficial — 4 prompts, chat template, greedy (temp=0)
+
+| Engine | decode tok/s | prefill tok/s | RSS MB | cache_hit % | ssd_stream MB |
+|---|---|---|---|---|---|
+| Ollama Q8_0 (baseline) | 41,32 | 587,82 | ~1740 (`1.7 GB`) | — | — |
+| PyTorch BF16 (baseline) | 3,81 | — | 3482,2 (pico) | — | — |
+| **crom-infer RAM (768)** | **47,78** | **52,92** | **871,2** | **100,00** | **0,00** |
+| **crom-infer SSD (576)** | **15,06** | **8,93** | **709,1** | **90,89** | **2971,90** |
+
+**Tokens 128 idênticos entre 768 e 576 nos 4 prompts**: confirmado
+(`crom_768_vs_576_ids_identical = true`).
+
+Médias por estágio (4 prompts): RAM — `attn_ms=927`, `moe_ms=2277`,
+`lm_head_ms=848`; SSD — `attn_ms=966`, `moe_ms=15951`, `lm_head_ms=809`.
+
+Respostas literais (RAM 768) resumidas: P1 explicação de tabela hash; P2
+definição de MoE em 3 frases (termina com `<|end_of_text|>`); P3 função C
+`addVectors(float *a, float *b, float *c, int n)`; P4 raciocínio passo a passo
+sobre 8 especialistas. Texto coerente e ids idênticos ao modo streaming.
+
+### Conclusão
+
+O wrapper Go+CGO agora entrega **47,8 tok/s médios (pico ~59)** com
+**871 MB RSS** e **100% de cache hit** no modo RAM Full — **~1,16× o Ollama
+Q8_0** em geração e **~12,5× o PyTorch BF16**. O modo streaming (`O_DIRECT`,
+576 experts) mantém **15,1 tok/s** com **709 MB RSS** e **ids bit-idênticos** ao
+modo RAM, custando **2971,9 MB** de leitura de disco. O tokenizador BPE nativo
+está **100% validado** contra o `AutoTokenizer` do HuggingFace, eliminando a
+dependência de Python no runtime.
+
+---
+
+

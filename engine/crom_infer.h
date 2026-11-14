@@ -84,7 +84,7 @@ typedef struct {
     void *hot_base;
     size_t hot_len;
 
-    uint16_t *embed_f16;       /* embed F16 (tied lm_head) — ~96 MiB */
+    uint16_t *embed_f16;
     float *norms_f32;
     float *routers_f32;
     float *inv_freq;
@@ -98,6 +98,7 @@ typedef struct {
     int streaming;
     int fd;
     int threads;
+    const char *path;  /* caminho do arquivo .cromllm */
 
     float *k_cache;
     float *v_cache;
@@ -108,7 +109,7 @@ typedef struct {
     long long cache_hits;
     long long cache_misses;
     long long ssd_bytes_read;
-    long long ssd_stream_bytes_read;  /* apenas leitura runtime (streaming) */
+    long long ssd_stream_bytes_read;
     double ssd_io_ms;
     double attn_ms;
     double moe_ms;
@@ -122,7 +123,10 @@ typedef struct {
     int dump_ckpt;
 } crom_cfg_t;
 
-/* API */
+/* ------------------------------------------------------------------ */
+/* API                                                                */
+/* ------------------------------------------------------------------ */
+
 int crom_model_open(const char *path, crom_model_t *m, int cache_experts, int threads);
 void crom_model_close(crom_model_t *m);
 int crom_forward(crom_model_t *m, const int *input_ids, int n_ids,
@@ -131,11 +135,16 @@ int crom_embed(crom_model_t *m, int token_id, float *hidden);
 int crom_layer_attn_resid(crom_model_t *m, int li, const float *hidden_in,
                           int pos, float *hidden_out);
 int crom_layer_moe_resid(crom_model_t *m, int li, const float *hidden_in,
-                         int pos, float *hidden_out,
-                         int *top8_out, float *top8_w_out);
+                          int pos, float *hidden_out,
+                          int *top8_out, float *top8_w_out);
 void crom_rms_norm(const float *w, const float *x, int n, float eps, float *out);
 void crom_stats(const crom_model_t *m, long long *hits, long long *misses,
                 long long *bytes, long long *stream_bytes, double *io_ms,
                 double *attn_ms, double *moe_ms, double *lm_head_ms);
+void crom_reset_kv(crom_model_t *m);
+
+/* tokenizer embutido */
+const void *crom_tokenizer_data(const crom_model_t *m, size_t *out_size);
+int crom_eos_id(void);  /* 0 = <|end_of_text|> */
 
 #endif /* CROM_INFER_H */

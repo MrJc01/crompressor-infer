@@ -240,7 +240,11 @@ int crom_model_open(const char *path, crom_model_t *m, int cache_experts,
     m->threads = threads;
     m->cache_experts = cache_experts;
     m->streaming = (cache_experts < CROM_NUM_DIR_ENTRIES);
-    m->fd = open(path, m->streaming ? (O_RDONLY | O_DIRECT) : O_RDONLY);
+    /* Copia o path para uso posterior no crom_tokenizer_data */
+    m->path = strdup(path);
+    if (!m->path) { perror("strdup"); return -1; }
+    m->streaming = (cache_experts < CROM_NUM_DIR_ENTRIES);
+    m->fd = open(m->path, m->streaming ? (O_RDONLY | O_DIRECT) : O_RDONLY);
     if (m->fd < 0) { perror("open"); return -1; }
 
     struct stat st;
@@ -683,6 +687,58 @@ crom_embed(m, input_ids[position], hidden);
     return 0;
 }
 
+/* tokenizer embutido - returns pointer to static buffer, caller must not free */
+const void *crom_tokenizer_data(const crom_model_t *m, size_t *out_size) {
+    if (out_size) *out_size = m->tokenizer_size;
+    if (m->tokenizer_size == 0) return NULL;
+    
+    /* tokenizer.json está no offset tokenizer_offset do arquivo */
+    static void *cached_buf = NULL;
+    static size_t cached_size = 0;
+    
+    if (cached_buf && cached_size == m->tokenizer_size) {
+        if (out_size) *out_size = cached_size;
+        return cached_buf;
+    }
+    
+    if (cached_buf) free(cached_buf);
+    
+    int fd = open(m->path, O_RDONLY);
+    if (fd < 0) return NULL;
+    
+    void *buf = malloc(m->tokenizer_size);
+    if (!buf) {
+        close(fd);
+        return NULL;
+    }
+    
+    ssize_t rd = pread(fd, buf, m->tokenizer_size, (off_t)m->tokenizer_offset);
+    close(fd);
+    
+    if (rd != (ssize_t)m->tokenizer_size) {
+        free(buf);
+        return NULL;
+    }
+    
+    cached_buf = buf;
+    cached_size = m->tokenizer_size;
+    if (out_size) *out_size = cached_size;
+    return cached_buf;
+}
+
+int crom_eos_id(void) {
+    return 0;  /* <|end_of_text|> */
+}
+
+void crom_reset_kv(crom_model_t *m) {
+    size_t kv_elems = (size_t)CROM_NUM_LAYERS * CROM_NUM_KV_HEADS * CROM_MAX_SEQ * CROM_HEAD_DIM;
+    memset(m->k_cache, 0, kv_elems * sizeof(float));
+    memset(m->v_cache, 0, kv_elems * sizeof(float));
+    m->attn_ms = 0.0;
+    m->moe_ms = 0.0;
+    m->lm_head_ms = 0.0;
+}
+
 /* ------------------------------------------------------------------ */
 /* estatisticas                                                       */
 /* ------------------------------------------------------------------ */
@@ -715,4 +771,5 @@ void crom_model_close(crom_model_t *m) {
     free(m->work1);
     free(m->moe_acc_buf);
     if (m->fd >= 0) close(m->fd);
+    if (m->path) free((void*)m->path);
 }
