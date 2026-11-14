@@ -1,0 +1,146 @@
+# Crompressor-Infer — Próximos Passos (Roadmap EXP-011+)
+
+> Documento de retomada. Consolida o que já foi **validado até o EXP-010** e os
+> marcos planejados para as próximas sessões. Sempre comparar qualquer novo
+> experimento contra o baseline registrado em `docs/01-ambiente-e-baseline.md`.
+
+## 1. Estado validado até o EXP-010
+
+### Motor e numérica
+
+- **Motor C + AVX2/FMA/F16C** (`engine/crom_infer.c`) operando sobre o formato
+  `.cromllm` alinhado a 4 KiB, com streaming `O_DIRECT`, LRU de experts e
+  KV-cache.
+- **Exatidão vs PyTorch BF16**: checkpoints de camada (`after_emb`,
+  `after_L0_attn_resid`, `after_L0_moe_resid`, `after_L23`), roteamento top-8 e
+  `next_token_id` validados (EXP-008 / EXP-009 / EXP-009B).
+- **`kv_q4` AVX2+FMA** no `q4_matvec` e FMA no `lm_head` (EXP-009B): decode no
+  modo RAM saltou de ~15,5 → **~57 tok/s** com exatidão preservada.
+
+### CLI Go+CGO (EXP-010)
+
+- `bin/crom-infer` (Go 1.22 + CGO) estável em **~59 tok/s** (RAM 768).
+  Os dois bugs da integração foram corrigidos:
+  - **`runtime.LockOSThread()`** — sem ele a goroutine migra entre OS threads e
+    o libgomp reconstrói/contende o time OpenMP a cada `crom_forward` (~100×
+    mais lento, com travamentos).
+  - **`debug.SetGCPercent(-1)`** — evita que workers do GC roubem núcleos do
+    time OpenMP durante a inferência.
+  - Timers `attn_ms` / `moe_ms` / `lm_head_ms` agora vêm de `crom_stats()`.
+
+### Tokenizador nativo (EXP-010)
+
+- `internal/tokenizer/tokenizer.go` reproduz o `GPT2TokenizerFast` do Granite:
+  split de `added_tokens` antes do BPE, tabela byte↔unicode GPT-2,
+  pré-tokenização ByteLevel com lookahead `\s+(?!\S)`, merges por rank e chat
+  template fiel.
+- **100 % `ids_go == ids_hf`** nos 5 casos de `tools/check_tokenizer.py`
+  (prompt cru + 4 prompts com chat template).
+- `eos_token_id` real = `0` (`<|end_of_text|>`).
+
+### Baseline EXP-010 (4 prompts, 6 threads)
+
+| Engine | decode tok/s | prefill tok/s | RSS MB | cache hit % | ssd_stream MB |
+|---|---|---|---|---|---|
+| PyTorch BF16 | 3,81 | — | 3.482 (pico) | — | — |
+| Ollama Q8_0 | 41,32 | 587,82 | ~1.740 | — | — |
+| **crom-infer RAM (768)** | **47,78** | 52,92 | **871** | 100,00 | 0,00 |
+| **crom-infer SSD (576)** | **15,06** | 8,93 | **709** | 90,89 | 2.971,90 |
+
+Tokens do modo SSD (576) **bit-idênticos** ao modo RAM (768) nos 4 prompts.
+
+### Gargalos conhecidos
+
+- **Prefill**: ~53 tok/s contra ~588 tok/s do Ollama — falta processamento em
+  lote (hoje é 1 token por `crom_forward`).
+- **Streaming SSD**: domina o tempo no modo 576 (`moe_ms` ≈ 15,9 s vs 2,3 s no
+  modo RAM); a espera de I/O não é sobreposta ao cálculo.
+- **Contexto**: `CROM_MAX_SEQ = 512` limita o histórico.
+
+---
+
+## 2. Marco Futuro A — Modelo maior que a RAM (Território Colibrì)
+
+**Objetivo:** provar que o motor continua útil quando o modelo **não cabe** na
+RAM, que é o diferencial real frente a soluções `mmap`.
+
+- Sair do `granite-1b` (que cabe inteiro em RAM) e empacotar no `.cromllm` um
+  MoE maior:
+  - `OLMoE-1B-7B` (64 experts, ~7 B parâmetros no total), ou
+  - `granite-3.1-moe:3b`.
+- Rodar sob orçamento limitado de RAM comparando:
+  - **crom-infer** — `O_DIRECT` + Cache LRU de experts (lê só o que o router
+    escolhe);
+  - **Ollama / llama.cpp** — `mmap` do arquivo de pesos.
+- Métricas: decode tok/s, latência p95, bytes lidos do SSD por token, RSS,
+  taxa de acerto do LRU e **degradação real em SSD SATA** (~500 MB/s) à medida
+  que o cache encolhe (ex.: 75 %, 50 %, 25 % dos experts residentes).
+- Critério de sucesso: manter throughput utilizável com fração de RAM muito
+  menor que o Ollama/`mmap`, demonstrando o ganho do streaming seletivo.
+
+---
+
+## 3. Marco Futuro B — Streaming SSD mais rápido + Compressão `C1_v2` + Prefill GEMM
+
+### B.1 Prefetch assíncrono de experts
+
+- Ler o **próximo** expert do SSD em paralelo enquanto a CPU calcula os experts
+  já residentes no cache (pipeline I/O ↔ compute).
+- Meta: subir o modo SSD de **~15 tok/s para 22–28+ tok/s**.
+- Medir sobreposição efetiva (`ssd_io_ms` escondido atrás de `moe_ms`) e impacto
+  no RSS/LRU.
+
+### B.2 Suporte a `format_id = 2` (`C1_v2`, 3,10 bits/peso)
+
+- Implementar no **empacotador** e no **motor C** o formato híbrido validado no
+  EXP-006:
+  - Codebook `d=4, K=256`;
+  - delta ternário esparso com escala por grupo de 64;
+  - **3,10 bits/peso** (~5,16× menor que BF16).
+- Perfil misto de camadas: `Q4` nas camadas extremas + `C1_v2` nas centrais.
+- Validar exatidão (checkpoints vs PyTorch) e throughput; comparar bytes lidos
+  por token e qualidade do texto.
+
+### B.3 Batch Prefill (GEMM)
+
+- Processar **vários tokens de prompt juntos** em vez de 1 por `crom_forward`.
+- Meta: aproximar o prefill dos **52,9 tok/s** atuais dos **587,8 tok/s** do
+  Ollama (ordem de grandeza).
+- Cuidados: manter o KV-cache e o roteamento MoE corretos por token dentro do
+  lote.
+
+---
+
+## 4. Marco Futuro C — Diferencial `crompressor` (Deltas P2P e Multi-Fine-Tune)
+
+### C.1 `W_base + Δ` (múltiplos fine-tunes na mesma RAM)
+
+- Suportar uma base comprimida + **deltas de 1 bit** por fine-tune, permitindo
+  servir vários ajustes sobre a mesma base sem duplicar o modelo em memória.
+- Definir formato do delta no `.cromllm` e caminho de aplicação no motor.
+
+### C.2 Distribuição/sincronização de deltas via P2P
+
+- Herdar conceitos de `crompressor/pkg/sync` para troca de deltas entre nós,
+  **fora do caminho quente de inferência** (nunca no hot path).
+- Foco em empacotamento, versionamento e verificação de integridade dos deltas.
+
+---
+
+## 5. Higiene e Empacotamento
+
+- Aumentar `CROM_MAX_SEQ` (ex.: **2048** ou tamanho dinâmico no cabeçalho).
+- Adicionar flag **`--repeat-penalty`** na amostragem.
+- Suportar **múltiplos modelos** no cabeçalho `.cromllm` (catálogo/versão).
+- Manter `crompressor/`, `artifacts/`, `bin/`, `*.a`, `*.o` fora do versionamento.
+
+---
+
+## 6. Ordem sugerida de retomada
+
+1. **B.1 Prefetch assíncrono** (ganho rápido no modo que mais sofre: SSD).
+2. **B.3 Batch Prefill (GEMM)** (elimina o maior gap vs Ollama).
+3. **B.2 `C1_v2`** (reduz bytes por token e viabiliza o Marco A).
+4. **A — modelo maior que a RAM** (usa B.1/B.2 como base).
+5. **C — deltas P2P / multi-fine-tune** (diferencial de produto).
+6. **Higiene** contínua (contexto maior, `--repeat-penalty`, multi-modelo).

@@ -6,6 +6,9 @@ crompressor/
 *.gguf
 *.crom*
 engine/crom_cli
+engine/*.o
+engine/*.a
+bin/
 *.log
 *.o
 *.so
