@@ -111,19 +111,15 @@ RAM, que é o diferencial real frente a soluções `mmap`.
 
 ---
 
-## 4. Marco Futuro C — Diferencial `crompressor` (Deltas P2P e Multi-Fine-Tune)
+## 4. Marco C — Diferencial `crompressor` (Deltas P2P e Multi-Fine-Tune) — CONCLUÍDO (EXP-014)
 
-### C.1 `W_base + Δ` (múltiplos fine-tunes na mesma RAM)
+### C.1 `W_base + Δ` (múltiplos fine-tunes na mesma RAM) — [x] CONCLUÍDO
+- Suporte a modelo Base (`granite-1b-base.cromllm`) + deltas de 1 bit por grupo de 64 (`granite-1b-instruct.cromdelta`).
+- Cálculo direto no motor C (`delta_matvec_add` AVX2 unrolled com FMA) sem materializar $W_{\text{instruct}}$.
+- Economia de 75,4% no armazenamento de deltas com qualidade de PPL (61.20) superior a Q4.
 
-- Suportar uma base comprimida + **deltas de 1 bit** por fine-tune, permitindo
-  servir vários ajustes sobre a mesma base sem duplicar o modelo em memória.
-- Definir formato do delta no `.cromllm` e caminho de aplicação no motor.
-
-### C.2 Distribuição/sincronização de deltas via P2P
-
-- Herdar conceitos de `crompressor/pkg/sync` para troca de deltas entre nós,
-  **fora do caminho quente de inferência** (nunca no hot path).
-- Foco em empacotamento, versionamento e verificação de integridade dos deltas.
+### C.2 Distribuição/sincronização de deltas via Rede — [x] CONCLUÍDO
+- Subcomandos `serve-delta` e `pull-delta` em Go nativo (`net/http` + `crypto/sha256`) com streaming por chunks de 1 MiB e validação criptográfica ponta a ponta.
 
 ---
 
@@ -135,6 +131,7 @@ RAM, que é o diferencial real frente a soluções `mmap`.
 - [x] **Batch Prefill GEMM e Prefetch Assíncrono via pthread** (**concluído no EXP-012**).
 - [x] **Layout Compacto C1_TOPK, format_id = 2 e Perfil Híbrido** (**concluído no EXP-013A**).
 - [x] **Kernel C C1_TOPK direto e Duelo Híbrido vs Q4 em SSD Streaming** (**concluído no EXP-013B**).
+- [x] **Multi-Fine-Tune Base + Delta 1-bit e Sync de Deltas por Rede** (**concluído no EXP-014**).
 - [ ] Suportar **múltiplos modelos** no cabeçalho `.cromllm` (catálogo/versão).
 - [x] Manter `crompressor/`, `artifacts/`, `bin/`, `*.a`, `*.o` fora do versionamento.
 
@@ -145,5 +142,5 @@ RAM, que é o diferencial real frente a soluções `mmap`.
 1. **EXP-011** (Motor Dinâmico + `--ctx 2048` + `--repeat-penalty`) — **CONCLUÍDO**.
 2. **EXP-012** (Batch Prefill GEMM + Prefetch Assíncrono SSD via `pthread` + pinning LRU) — **CONCLUÍDO**.
 3. **EXP-013A / EXP-013B** (`C1_TOPK_K8` híbrido: 3,75 bits/peso, +19,5% tok/s em SSD 576) — **CONCLUÍDO**.
-4. **Marco A — modelo maior que a RAM** (ex.: OLMoE 1B-7B sob orçamento restrito de RAM).
-5. **Marco C — deltas P2P / multi-fine-tune** (diferencial de produto).
+4. **EXP-014** (Multi-Fine-Tune Base+Delta 1-bit + Sync de Delta via Rede HTTP) — **CONCLUÍDO**.
+5. **Marco A — modelo maior que a RAM** (ex.: OLMoE 1B-7B sob orçamento restrito de RAM).

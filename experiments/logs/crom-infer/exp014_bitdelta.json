@@ -1,0 +1,36 @@
+{
+  "l2_relative_diff": {
+    "embed_tokens": 0.036475,
+    "norms": 0.000426,
+    "routers": 0.0,
+    "attn": 0.056737,
+    "experts": 0.046746
+  },
+  "results": {
+    "base_puro": {
+      "nll": 3.9374,
+      "ppl": 51.287,
+      "gen": "A mixture of experts (MoE) model combines multiple expert networks to make predictions, where each expert network has its own set of parameters and weights. The MoE model learns the optimal combination of these individual models based on input data, allowing it to capture complex patterns and relationships within the dataset."
+    },
+    "instruct_puro": {
+      "nll": 4.0344,
+      "ppl": 56.511,
+      "gen": "A Mixture-of-Experts (MoE) neural network is an extension of the Expert System architecture where multiple expert networks operate independently within a single model, each specializing in different aspects or \"experts.\" These experts can be trained on distinct data subsets and then combined to make predictions across the"
+    },
+    "base_delta_1bit": {
+      "nll": 4.1142,
+      "ppl": 61.203,
+      "delta_size_mb": 204.02,
+      "gen": "Mixture of experts (MoE)neural networks are an ensemble learning method that combines multiple expert models to make predictions on new data. The idea behind this approach was inspired from the hows'ologies like Bayesian inference and Markov chain Monte Carlo methods. In essence, it means building"
+    },
+    "base_delta_2bit": {
+      "nll": NaN,
+      "ppl": NaN,
+      "delta_size_mb": 364.55,
+      "gen": ""
+    }
+  },
+  "full_model_mb": 829.47,
+  "savings_1bit_pct": 75.4,
+  "savings_2bit_pct": 56.1
+}

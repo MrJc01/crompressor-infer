@@ -174,3 +174,29 @@ Em um perfil híbrido (ex.: `Hibrido_Q4_C1_topk8` com camadas extremas `0..3, 20
 inteiro (884 736 B) em ~2,6 ms no SSD SATA do EXP-001 (344,5 MB/s em 1 MiB).
 Com cache LRU cap 24/32 → ~21 MB/token (EXP-005) ≈ 60 ms/token de I/O puro;
 com experts residentes (Q4, 648 MB) o disco não entra.
+
+## 9. Formato Multi-Fine-Tune (`.cromdelta` v1 — EXP-014)
+
+O formato `.cromdelta` implementa a técnica de Multi-Fine-Tune do `crompressor`, permitindo servir múltiplos modelos derivados (ex.: Instruct, Chat, Especialistas) a partir de um único modelo base compartilhado na memória RAM/SSD, calculando diretamente sobre deltas compactos sem materializar $W_{\text{derivado}}$:
+
+$$y = (W_{\text{base}} + \Delta) \cdot x = W_{\text{base}} \cdot x + \Delta \cdot x$$
+
+### 9.1 Estrutura do Arquivo `.cromdelta`
+
+1. **Header (4096 bytes, alinhado a 4K):**
+   - Magic: `CROMLD01` (8 bytes)
+   - Metadados: versão (1), formato do delta (1 = 1-bit per group), vocab_base, vocab_delta, hidden_size, intermediate_size, num_layers, num_attn_heads, num_kv_heads, head_dim, num_experts, group_size (64), reserved.
+   - Offsets e tamanhos de seções de patch: `tokenizer`, `embed_tokens`, `norms`, `routers`, `attention_deltas`, `expert_dir`, `expert_deltas`.
+2. **Tokenizer & Embeddings Patch:**
+   - `tokenizer.json` do modelo derivado.
+   - `embed_tokens` (FP16): substitui/expande o vocabulário base (ex.: Granite Base 49152 → Instruct 49155 com tokens de controle de chat).
+3. **Norms & Routers Patch:**
+   - `norms` (FP32) e `routers` (FP32): tensores pequenos atualizados in-place.
+4. **Attention Deltas (1-bit por grupo de 64):**
+   - 24 camadas $\times$ (Q, K, V, O proj).
+   - Layout: por grupo de 64 pesos, 8 bytes de sinais (bit $i=1$ se $\Delta \ge 0$, $0$ se $\Delta < 0$) + 2 bytes FP16 $\alpha = \text{mean}(|\Delta|)$. Taxa: **1,25 bits/peso**.
+5. **Expert Directory e Expert Deltas (1-bit por grupo de 64):**
+   - 768 experts $\times$ 245.760 bytes por expert (60 páginas 4K exatas, zero padding!).
+   - Cada expert contém: `input_linear` [1024, 1024] (163.840 B) + `output_linear` [1024, 512] (81.920 B).
+6. **Kernel AVX2:**
+   - `delta_matvec_add`: acumula $\Delta \cdot x$ com FMA unrolled/AVX2 em paralelo via OpenMP sem overhead de materialização.

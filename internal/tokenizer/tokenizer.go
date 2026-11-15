@@ -33,9 +33,9 @@ type addedToken struct {
 // TokenizerJSON represents the structure of tokenizer.json
 type TokenizerJSON struct {
 	Model struct {
-		Type   string         `json:"type"`
-		Vocab  map[string]int `json:"vocab"`
-		Merges [][2]string    `json:"merges"`
+		Type   string          `json:"type"`
+		Vocab  map[string]int  `json:"vocab"`
+		Merges json.RawMessage `json:"merges"`
 	} `json:"model"`
 	AddedTokens []struct {
 		ID      int    `json:"id"`
@@ -90,7 +90,7 @@ func NewFromJSON(data []byte) (*Tokenizer, error) {
 	t := &Tokenizer{
 		vocab:         make(map[string]int, len(tj.Model.Vocab)),
 		idToToken:     make(map[int]string, len(tj.Model.Vocab)),
-		merges:        make(map[string]int, len(tj.Model.Merges)),
+		merges:        make(map[string]int),
 		specialTokens: make(map[int]string),
 		byteToUni:     b2u,
 		uniToByte:     u2b,
@@ -102,8 +102,23 @@ func NewFromJSON(data []byte) (*Tokenizer, error) {
 		t.idToToken[id] = token
 	}
 
-	for i, merge := range tj.Model.Merges {
-		t.merges[merge[0]+"\x00"+merge[1]] = i
+	if len(tj.Model.Merges) > 0 {
+		var mergesPair [][2]string
+		if err := json.Unmarshal(tj.Model.Merges, &mergesPair); err == nil {
+			for i, merge := range mergesPair {
+				t.merges[merge[0]+"\x00"+merge[1]] = i
+			}
+		} else {
+			var mergesStr []string
+			if err := json.Unmarshal(tj.Model.Merges, &mergesStr); err == nil {
+				for i, merge := range mergesStr {
+					parts := strings.Split(merge, " ")
+					if len(parts) >= 2 {
+						t.merges[parts[0]+"\x00"+parts[1]] = i
+					}
+				}
+			}
+		}
 	}
 
 	for _, at := range tj.AddedTokens {

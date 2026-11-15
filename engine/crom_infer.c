@@ -316,6 +316,137 @@ void c1_matmul_batch(const crom_c1_mat_t *W, const float *X, int B, int stride_X
 }
 
 /* ------------------------------------------------------------------ */
+/* Kernels Delta 1-bit (EXP-014: Multi-Fine-Tune Base + Delta)        */
+/* ------------------------------------------------------------------ */
+
+size_t mat_delta_1bit_bytes(int rows, int cols) {
+    size_t ng = cols / CROM_GROUP_SIZE;
+    size_t num_groups = (size_t)rows * ng;
+    return num_groups * 8 + num_groups * sizeof(uint16_t);
+}
+
+crom_delta_mat_t delta_mat_from(const uint8_t *p, int rows, int cols) {
+    crom_delta_mat_t M;
+    M.rows = rows;
+    M.cols = cols;
+    size_t ng = cols / CROM_GROUP_SIZE;
+    size_t num_groups = (size_t)rows * ng;
+    M.signs = p;
+    M.scales = (const uint16_t *)(p + num_groups * 8);
+    return M;
+}
+
+void delta_matvec_add(const crom_delta_mat_t *d, const float *x, float *out, int threads) {
+    (void)threads;
+    const int rows = d->rows;
+    const int cols = d->cols;
+    const int ng = cols / CROM_GROUP_SIZE;
+    const uint8_t *signs = d->signs;
+    const uint16_t *scales = d->scales;
+
+    /* Tabela de constantes para desempacotar 8 bits em 8 floats: +1.0f e -1.0f */
+    const __m256 one_ps = _mm256_set1_ps(1.0f);
+    const __m256 minus_one_ps = _mm256_set1_ps(-1.0f);
+
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; r++) {
+        const uint8_t *r_signs = signs + (size_t)r * ng * 8;
+        const uint16_t *r_scales = scales + (size_t)r * ng;
+        __m256 row_acc = _mm256_setzero_ps();
+
+        for (int g = 0; g < ng; g++) {
+            float alpha = _cvtsh_ss(r_scales[g]);
+            if (alpha == 0.0f) continue;
+
+            const float *xg = x + g * CROM_GROUP_SIZE;
+            const uint8_t *g_signs = r_signs + g * 8;
+            __m256 alpha_v = _mm256_set1_ps(alpha);
+            __m256 g_acc = _mm256_setzero_ps();
+
+            for (int byte_idx = 0; byte_idx < 8; byte_idx++) {
+                uint8_t sb = g_signs[byte_idx];
+                __m256 xv = _mm256_loadu_ps(xg + byte_idx * 8);
+
+                /* Máscara de 8 bits para os 8 floats */
+                __m256i bit_mask = _mm256_set_epi32(
+                    (sb & 128) ? -1 : 0,
+                    (sb & 64)  ? -1 : 0,
+                    (sb & 32)  ? -1 : 0,
+                    (sb & 16)  ? -1 : 0,
+                    (sb & 8)   ? -1 : 0,
+                    (sb & 4)   ? -1 : 0,
+                    (sb & 2)   ? -1 : 0,
+                    (sb & 1)   ? -1 : 0
+                );
+                __m256 sign_v = _mm256_blendv_ps(minus_one_ps, one_ps, _mm256_castsi256_ps(bit_mask));
+                g_acc = _mm256_fmadd_ps(sign_v, xv, g_acc);
+            }
+            row_acc = _mm256_fmadd_ps(alpha_v, g_acc, row_acc);
+        }
+        out[r] += hsum256(row_acc);
+    }
+}
+
+void delta_matmul_batch_add(const crom_delta_mat_t *d, const float *X, int B, int stride_X,
+                            float *Out, int stride_Out, int threads) {
+    (void)threads;
+    if (B == 1) {
+        delta_matvec_add(d, X, Out, threads);
+        return;
+    }
+    const int rows = d->rows;
+    const int cols = d->cols;
+    const int ng = cols / CROM_GROUP_SIZE;
+    const uint8_t *signs = d->signs;
+    const uint16_t *scales = d->scales;
+
+#pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; r++) {
+        const uint8_t *r_signs = signs + (size_t)r * ng * 8;
+        const uint16_t *r_scales = scales + (size_t)r * ng;
+
+        __m256 acc[B];
+        for (int b = 0; b < B; b++) acc[b] = _mm256_setzero_ps();
+
+        for (int g = 0; g < ng; g++) {
+            float alpha = _cvtsh_ss(r_scales[g]);
+            if (alpha == 0.0f) continue;
+
+            const uint8_t *g_signs = r_signs + g * 8;
+            float W_delta[64];
+            for (int byte_idx = 0; byte_idx < 8; byte_idx++) {
+                uint8_t sb = g_signs[byte_idx];
+                float *wb = W_delta + byte_idx * 8;
+                wb[0] = (sb & 1) ? alpha : -alpha;
+                wb[1] = (sb & 2) ? alpha : -alpha;
+                wb[2] = (sb & 4) ? alpha : -alpha;
+                wb[3] = (sb & 8) ? alpha : -alpha;
+                wb[4] = (sb & 16) ? alpha : -alpha;
+                wb[5] = (sb & 32) ? alpha : -alpha;
+                wb[6] = (sb & 64) ? alpha : -alpha;
+                wb[7] = (sb & 128) ? alpha : -alpha;
+            }
+
+            __m256 w_vec[8];
+            for (int i = 0; i < 8; i++) {
+                w_vec[i] = _mm256_loadu_ps(&W_delta[i * 8]);
+            }
+
+            for (int b = 0; b < B; b++) {
+                const float *xg = X + (size_t)b * stride_X + g * CROM_GROUP_SIZE;
+                for (int i = 0; i < 8; i++) {
+                    acc[b] = _mm256_fmadd_ps(w_vec[i], _mm256_loadu_ps(xg + i * 8), acc[b]);
+                }
+            }
+        }
+
+        for (int b = 0; b < B; b++) {
+            Out[(size_t)b * stride_Out + r] += hsum256(acc[b]);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* RMSNorm FP32 (exportado)                                           */
 /* ------------------------------------------------------------------ */
 
@@ -879,6 +1010,12 @@ int crom_layer_attn_resid(crom_model_t *m, int li, const float *hidden_in,
     q4_matvec(&A->k_proj, work1, work3, m->threads);
     q4_matvec(&A->v_proj, work1, work4, m->threads);
 
+    if (m->delta && m->delta->attn) {
+        delta_matvec_add(&m->delta->attn[li].q_proj, work1, work2, m->threads);
+        delta_matvec_add(&m->delta->attn[li].k_proj, work1, work3, m->threads);
+        delta_matvec_add(&m->delta->attn[li].v_proj, work1, work4, m->threads);
+    }
+
     for (int h = 0; h < num_q_heads; h++)
         rope_split_half(work2 + h * head_dim, pos, m->inv_freq, head_dim);
     for (int h = 0; h < num_kv_heads; h++)
@@ -923,6 +1060,9 @@ int crom_layer_attn_resid(crom_model_t *m, int li, const float *hidden_in,
     }
 
     q4_matvec(&A->o_proj, attn_out, work1, m->threads);
+    if (m->delta && m->delta->attn) {
+        delta_matvec_add(&m->delta->attn[li].o_proj, attn_out, work1, m->threads);
+    }
 
     for (int i = 0; i < H; i++)
         hidden_out[i] = hidden_in[i] + work1[i] * m->residual_multiplier;
@@ -944,29 +1084,45 @@ static inline void crom_eval_expert_matvec(crom_model_t *m, int li, int expert_i
     crom_expert_t *E = &m->layers[li].experts[expert_id];
     E->format_id = fmt;
 
+    crom_delta_mat_t d_in, d_out;
+    int has_delta = 0;
+    if (m->delta && m->delta->exp_base) {
+        const uint8_t *exp_d = m->delta->exp_base + (size_t)dir_id * 245760;
+        size_t in_d_sz = mat_delta_1bit_bytes(2 * I, H);
+        d_in = delta_mat_from(exp_d, 2 * I, H);
+        d_out = delta_mat_from(exp_d + in_d_sz, H, I);
+        has_delta = 1;
+    }
+
     if (fmt == 1) {
         size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
         E->q4_in = q4_mat_from(payload, 2 * I, H);
         E->q4_out = q4_mat_from(payload + in_sz, H, I);
         q4_matvec(&E->q4_in, work1, work3, m->threads);
+        if (has_delta) delta_matvec_add(&d_in, work1, work3, m->threads);
+
         for (int i = 0; i < I; i++) {
             float g = silu(work3[i]);
             float u = work3[I + i];
             work3[i] = g * u;
         }
         q4_matvec(&E->q4_out, work3, work4, m->threads);
+        if (has_delta) delta_matvec_add(&d_out, work3, work4, m->threads);
     } else {
         int k_delta = (fmt == 2) ? 8 : 4;
         size_t in_sz = mat_c1_bytes(2 * I, H, k_delta);
         E->c1_in = c1_mat_from(payload, 2 * I, H, k_delta);
         E->c1_out = c1_mat_from(payload + in_sz, H, I, k_delta);
         c1_matvec(&E->c1_in, work1, work3, m->threads);
+        if (has_delta) delta_matvec_add(&d_in, work1, work3, m->threads);
+
         for (int i = 0; i < I; i++) {
             float g = silu(work3[i]);
             float u = work3[I + i];
             work3[i] = g * u;
         }
         c1_matvec(&E->c1_out, work3, work4, m->threads);
+        if (has_delta) delta_matvec_add(&d_out, work3, work4, m->threads);
     }
     for (int i = 0; i < H; i++) moe_acc[i] += work4[i] * w;
 }
@@ -982,6 +1138,16 @@ static inline void crom_eval_expert_tokens(crom_model_t *m, int li, int e, int d
     crom_expert_t *E = &m->layers[li].experts[e];
     E->format_id = fmt;
 
+    crom_delta_mat_t d_in, d_out;
+    int has_delta = 0;
+    if (m->delta && m->delta->exp_base) {
+        const uint8_t *exp_d = m->delta->exp_base + (size_t)dir_id * 245760;
+        size_t in_d_sz = mat_delta_1bit_bytes(2 * I, H);
+        d_in = delta_mat_from(exp_d, 2 * I, H);
+        d_out = delta_mat_from(exp_d + in_d_sz, H, I);
+        has_delta = 1;
+    }
+
     if (fmt == 1) {
         size_t in_sz = mat_q4_bytes(2 * I, H, m->group_size);
         E->q4_in = q4_mat_from(payload, 2 * I, H);
@@ -994,12 +1160,16 @@ static inline void crom_eval_expert_tokens(crom_model_t *m, int li, int e, int d
             float out_v[H];
 
             q4_matvec(&E->q4_in, x, inter, m->threads);
+            if (has_delta) delta_matvec_add(&d_in, x, inter, m->threads);
+
             for (int k = 0; k < I; k++) {
                 float g = silu(inter[k]);
                 float u = inter[I + k];
                 inter[k] = g * u;
             }
             q4_matvec(&E->q4_out, inter, out_v, m->threads);
+            if (has_delta) delta_matvec_add(&d_out, inter, out_v, m->threads);
+
             float *mb = moe_out + (size_t)b * H;
             for (int k = 0; k < H; k++) mb[k] += out_v[k] * w;
         }
@@ -1016,12 +1186,16 @@ static inline void crom_eval_expert_tokens(crom_model_t *m, int li, int e, int d
             float out_v[H];
 
             c1_matvec(&E->c1_in, x, inter, m->threads);
+            if (has_delta) delta_matvec_add(&d_in, x, inter, m->threads);
+
             for (int k = 0; k < I; k++) {
                 float g = silu(inter[k]);
                 float u = inter[I + k];
                 inter[k] = g * u;
             }
             c1_matvec(&E->c1_out, inter, out_v, m->threads);
+            if (has_delta) delta_matvec_add(&d_out, inter, out_v, m->threads);
+
             float *mb = moe_out + (size_t)b * H;
             for (int k = 0; k < H; k++) mb[k] += out_v[k] * w;
         }
@@ -1389,6 +1563,12 @@ int crom_forward_batch(crom_model_t *m, const int *input_ids, int n_tokens,
         q4_matmul_batch(&A->k_proj, norm_buf, B, H, k_buf, (int)kv_dim, m->threads);
         q4_matmul_batch(&A->v_proj, norm_buf, B, H, v_buf, (int)kv_dim, m->threads);
 
+        if (m->delta && m->delta->attn) {
+            delta_matmul_batch_add(&m->delta->attn[li].q_proj, norm_buf, B, H, q_buf, (int)q_dim, m->threads);
+            delta_matmul_batch_add(&m->delta->attn[li].k_proj, norm_buf, B, H, k_buf, (int)kv_dim, m->threads);
+            delta_matmul_batch_add(&m->delta->attn[li].v_proj, norm_buf, B, H, v_buf, (int)kv_dim, m->threads);
+        }
+
         /* 2c. RoPE e preenchimento do KV cache */
         float *k_cache = m->k_cache;
         float *v_cache = m->v_cache;
@@ -1454,6 +1634,9 @@ int crom_forward_batch(crom_model_t *m, const int *input_ids, int n_tokens,
 
         /* 2e. O projection batch GEMM */
         q4_matmul_batch(&A->o_proj, attn_out, B, (int)q_dim, o_buf, H, m->threads);
+        if (m->delta && m->delta->attn) {
+            delta_matmul_batch_add(&m->delta->attn[li].o_proj, attn_out, B, (int)q_dim, o_buf, H, m->threads);
+        }
 
         /* 2f. Residual connection */
 #pragma omp parallel for schedule(static)
@@ -1726,6 +1909,12 @@ int crom_forward_batch(crom_model_t *m, const int *input_ids, int n_tokens,
 
 /* tokenizer embutido - returns pointer to static buffer, caller must not free */
 const void *crom_tokenizer_data(const crom_model_t *m, size_t *out_size) {
+    /* Se delta tiver tokenizer embutido, usa o do delta */
+    if (m->delta && m->delta->tok_size > 0 && m->delta->raw_data) {
+        if (out_size) *out_size = (size_t)m->delta->tok_size;
+        return (const uint8_t *)m->delta->raw_data + m->delta->tok_offset;
+    }
+
     if (out_size) *out_size = m->tokenizer_size;
     if (m->tokenizer_size == 0) return NULL;
     
@@ -1777,6 +1966,137 @@ void crom_reset_kv(crom_model_t *m) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Multi-Fine-Tune cromdelta loader                                   */
+/* ------------------------------------------------------------------ */
+
+int crom_model_apply_delta(crom_model_t *m, const char *delta_path) {
+    if (!delta_path || !m) return -1;
+
+    int fd = open(delta_path, O_RDONLY);
+    if (fd < 0) { perror("open delta"); return -1; }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) { perror("fstat delta"); close(fd); return -1; }
+    size_t fsize = (size_t)st.st_size;
+
+    void *raw = malloc(fsize);
+    if (!raw) { perror("malloc delta"); close(fd); return -1; }
+    if (pread(fd, raw, fsize, 0) != (ssize_t)fsize) {
+        fprintf(stderr, "leitura delta falhou\n"); free(raw); close(fd); return -1;
+    }
+    close(fd);
+
+    uint8_t *p = (uint8_t *)raw;
+    if (memcmp(p, "CROMLD01", 8) != 0) {
+        fprintf(stderr, "magic delta invalido: %.8s\n", p); free(raw); return -1;
+    }
+
+    uint32_t version     = rd_u32(p + 8);
+    uint32_t delta_fmt   = rd_u32(p + 12);
+    uint32_t vocab_base  = rd_u32(p + 16);
+    uint32_t vocab_delta = rd_u32(p + 20);
+    uint32_t hidden      = rd_u32(p + 24);
+    uint32_t inter       = rd_u32(p + 28);
+    uint32_t layers      = rd_u32(p + 32);
+    uint32_t q_heads     = rd_u32(p + 36);
+    uint32_t kv_heads    = rd_u32(p + 40);
+    uint32_t head_dim    = rd_u32(p + 44);
+    uint32_t num_exp     = rd_u32(p + 48);
+    uint32_t grp_sz      = rd_u32(p + 52);
+    (void)grp_sz;
+
+    if (version != 1 || delta_fmt != 1 || hidden != m->hidden_size || layers != m->num_layers) {
+        fprintf(stderr, "Delta incompativel com modelo base: ver=%u fmt=%u H=%u L=%u\n",
+                version, delta_fmt, hidden, layers);
+        free(raw);
+        return -1;
+    }
+
+    uint64_t tok_off     = rd_u64(p + 60);
+    uint64_t tok_sz      = rd_u64(p + 68);
+    uint64_t embed_off   = rd_u64(p + 76);
+    uint64_t embed_sz    = rd_u64(p + 84);
+    uint64_t norms_off   = rd_u64(p + 92);
+    uint64_t norms_sz    = rd_u64(p + 100);
+    uint64_t routers_off = rd_u64(p + 108);
+    uint64_t routers_sz  = rd_u64(p + 116);
+    uint64_t attn_off    = rd_u64(p + 124);
+    uint64_t attn_sz     = rd_u64(p + 132);
+    uint64_t dir_off     = rd_u64(p + 140);
+    uint32_t dir_count   = rd_u32(p + 148);
+    uint32_t dir_entry_sz= rd_u32(p + 152);
+    uint64_t exp_off     = rd_u64(p + 156);
+    uint64_t exp_sz      = rd_u64(p + 164);
+
+    crom_delta_t *d = calloc(1, sizeof(crom_delta_t));
+    if (!d) { perror("calloc delta"); free(raw); return -1; }
+    d->raw_data = raw;
+    d->raw_size = fsize;
+    d->vocab_base = vocab_base;
+    d->vocab_delta = vocab_delta;
+    d->hidden_size = hidden;
+    d->intermediate_size = inter;
+    d->num_layers = layers;
+    d->num_experts = num_exp;
+    d->tok_offset = tok_off;
+    d->tok_size = tok_sz;
+    d->embed_offset = embed_off;
+    d->embed_size = embed_sz;
+    d->norms_offset = norms_off;
+    d->norms_size = norms_sz;
+    d->routers_offset = routers_off;
+    d->routers_size = routers_sz;
+    d->attn_offset = attn_off;
+    d->attn_size = attn_sz;
+    d->dir_offset = dir_off;
+    d->dir_count = dir_count;
+    d->dir_entry_size = dir_entry_sz;
+    d->exp_offset = exp_off;
+    d->exp_size = exp_sz;
+
+    /* 1. Patch de Embeddings: expande vocab se delta > base e atualiza ponteiro */
+    if (vocab_delta >= vocab_base && embed_sz >= (size_t)vocab_delta * hidden * sizeof(uint16_t)) {
+        m->embed_f16 = (uint16_t *)(p + embed_off);
+        m->vocab_size = vocab_delta;
+    }
+
+    /* 2. Patch de Norms: sobrescreve norms_f32 com as do instruct */
+    if (norms_sz > 0 && m->norms_f32) {
+        memcpy(m->norms_f32, p + norms_off, norms_sz);
+    }
+
+    /* 3. Patch de Routers: sobrescreve routers_f32 com os do instruct */
+    if (routers_sz > 0 && m->routers_f32) {
+        memcpy(m->routers_f32, p + routers_off, routers_sz);
+    }
+
+    /* 4. Estruturas de atenção 1-bit deltas */
+    d->attn = calloc(layers, sizeof(crom_delta_attn_t));
+    if (!d->attn) { perror("calloc delta attn"); free(d); free(raw); return -1; }
+
+    uint8_t *ap = p + attn_off;
+    for (int li = 0; li < (int)layers; li++) {
+        d->attn[li].q_proj = delta_mat_from(ap, q_heads * head_dim, hidden);
+        ap += mat_delta_1bit_bytes(q_heads * head_dim, hidden);
+
+        d->attn[li].k_proj = delta_mat_from(ap, kv_heads * head_dim, hidden);
+        ap += mat_delta_1bit_bytes(kv_heads * head_dim, hidden);
+
+        d->attn[li].v_proj = delta_mat_from(ap, kv_heads * head_dim, hidden);
+        ap += mat_delta_1bit_bytes(kv_heads * head_dim, hidden);
+
+        d->attn[li].o_proj = delta_mat_from(ap, hidden, q_heads * head_dim);
+        ap += mat_delta_1bit_bytes(hidden, q_heads * head_dim);
+    }
+
+    /* 5. Base dos experts deltas */
+    d->exp_base = p + exp_off;
+    m->delta = d;
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* estatisticas                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -1798,7 +2118,7 @@ void crom_model_close(crom_model_t *m) {
     free(m->expert_pool);
     free(m->dir);
     free(m->hot_base);
-    /* m->embed_f16 aponta para dentro de hot_base — NÃO free() */
+    /* m->embed_f16 aponta para dentro de hot_base ou delta->raw_data — NÃO free() */
     free(m->norms_f32);
     free(m->routers_f32);
     free(m->inv_freq);
@@ -1826,6 +2146,12 @@ void crom_model_close(crom_model_t *m) {
         free(m->batch_work);
         m->batch_work = NULL;
         m->batch_work_cap = 0;
+    }
+    if (m->delta) {
+        if (m->delta->attn) free(m->delta->attn);
+        if (m->delta->raw_data) free(m->delta->raw_data);
+        free(m->delta);
+        m->delta = NULL;
     }
     if (m->fd >= 0) close(m->fd);
     if (m->path) free((void*)m->path);

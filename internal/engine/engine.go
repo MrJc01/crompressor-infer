@@ -27,6 +27,7 @@ type Model struct {
 // Config holds model configuration
 type Config struct {
 	ModelPath    string
+	DeltaPath    string
 	CacheExperts int
 	Threads      int
 	MaxSeq       int
@@ -54,8 +55,27 @@ func Open(config Config) (*Model, error) {
 	}
 
 	m := &Model{model: model}
+	if config.DeltaPath != "" {
+		if err := m.ApplyDelta(config.DeltaPath); err != nil {
+			m.Close()
+			return nil, fmt.Errorf("failed to apply delta: %w", err)
+		}
+	}
+
 	runtime.SetFinalizer(m, (*Model).Close)
 	return m, nil
+}
+
+// ApplyDelta applies a .cromdelta Multi-Fine-Tune patch to the model
+func (m *Model) ApplyDelta(deltaPath string) error {
+	cDelta := C.CString(deltaPath)
+	defer C.free(unsafe.Pointer(cDelta))
+
+	ret := C.crom_model_apply_delta(&m.model, cDelta)
+	if ret != 0 {
+		return errors.New("failed to apply delta patch")
+	}
+	return nil
 }
 
 // VocabSize returns model vocabulary size

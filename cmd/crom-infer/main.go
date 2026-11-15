@@ -1,9 +1,12 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -16,6 +19,7 @@ import (
 
 type Config struct {
 	ModelPath     string
+	DeltaPath     string
 	Prompt        string
 	Chat          bool
 	MaxTokens     int
@@ -31,8 +35,20 @@ type Config struct {
 }
 
 func main() {
+	if len(os.Args) > 1 {
+		if os.Args[1] == "serve-delta" {
+			runServeDelta(os.Args[2:])
+			return
+		}
+		if os.Args[1] == "pull-delta" {
+			runPullDelta(os.Args[2:])
+			return
+		}
+	}
+
 	cfg := Config{}
 	flag.StringVar(&cfg.ModelPath, "model", "artifacts/granite-1b.cromllm", "Model path")
+	flag.StringVar(&cfg.DeltaPath, "delta", "", "Path to .cromdelta Multi-Fine-Tune patch")
 	flag.StringVar(&cfg.Prompt, "prompt", "", "Prompt text")
 	flag.BoolVar(&cfg.Chat, "chat", false, "Apply Granite chat template")
 	flag.IntVar(&cfg.MaxTokens, "max-tokens", 128, "Max tokens to generate")
@@ -72,6 +88,7 @@ func main() {
 	startLoad := time.Now()
 	model, err := engine.Open(engine.Config{
 		ModelPath:    cfg.ModelPath,
+		DeltaPath:    cfg.DeltaPath,
 		CacheExperts: cfg.CacheExperts,
 		Threads:      cfg.Threads,
 		MaxSeq:       cfg.Ctx,
@@ -267,4 +284,134 @@ func getRSSKB() int64 {
 		}
 	}
 	return 0
+}
+
+func runServeDelta(args []string) {
+	fs := flag.NewFlagSet("serve-delta", flag.ExitOnError)
+	filePath := fs.String("file", "artifacts/granite-1b-instruct.cromdelta", "Path to .cromdelta file to serve")
+	addr := fs.String("addr", "127.0.0.1:18421", "HTTP address to bind")
+	fs.Parse(args)
+
+	data, err := os.ReadFile(*filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading delta file %s: %v\n", *filePath, err)
+		os.Exit(1)
+	}
+
+	hash := sha256.Sum256(data)
+	shaHex := fmt.Sprintf("%x", hash)
+	fileSize := len(data)
+
+	http.HandleFunc("/meta", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"filename": *filePath,
+			"size":     fileSize,
+			"sha256":   shaHex,
+		})
+	})
+
+	http.HandleFunc("/delta", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("X-SHA256", shaHex)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", fileSize))
+		w.WriteHeader(http.StatusOK)
+
+		chunkSize := 1024 * 1024 // 1 MiB chunks
+		for i := 0; i < fileSize; i += chunkSize {
+			end := i + chunkSize
+			if end > fileSize {
+				end = fileSize
+			}
+			w.Write(data[i:end])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	})
+
+	fmt.Printf("Serving %s (%d bytes, SHA-256: %s) on http://%s\n", *filePath, fileSize, shaHex, *addr)
+	if err := http.ListenAndServe(*addr, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "Server failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runPullDelta(args []string) {
+	fs := flag.NewFlagSet("pull-delta", flag.ExitOnError)
+	urlStr := fs.String("url", "http://127.0.0.1:18421", "Base URL of server")
+	outPath := fs.String("out", "/tmp/pulled.cromdelta", "Destination file path")
+	fs.Parse(args)
+
+	baseURL := strings.TrimRight(*urlStr, "/")
+	respMeta, err := http.Get(baseURL + "/meta")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to fetch metadata from %s/meta: %v\n", baseURL, err)
+		os.Exit(1)
+	}
+	defer respMeta.Body.Close()
+
+	var meta struct {
+		Filename string `json:"filename"`
+		Size     int64  `json:"size"`
+		SHA256   string `json:"sha256"`
+	}
+	if err := json.NewDecoder(respMeta.Body).Decode(&meta); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to decode metadata: %v\n", err)
+		os.Exit(1)
+	}
+
+	start := time.Now()
+	respDelta, err := http.Get(baseURL + "/delta")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to fetch delta from %s/delta: %v\n", baseURL, err)
+		os.Exit(1)
+	}
+	defer respDelta.Body.Close()
+
+	outFile, err := os.Create(*outPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create output file %s: %v\n", *outPath, err)
+		os.Exit(1)
+	}
+	defer outFile.Close()
+
+	hasher := sha256.New()
+	multiWriter := io.MultiWriter(outFile, hasher)
+
+	buf := make([]byte, 1024*1024) // 1 MiB chunk
+	var totalCopied int64
+	for {
+		nr, rerr := respDelta.Body.Read(buf)
+		if nr > 0 {
+			nw, werr := multiWriter.Write(buf[:nr])
+			if werr != nil {
+				fmt.Fprintf(os.Stderr, "Write error: %v\n", werr)
+				os.Exit(1)
+			}
+			totalCopied += int64(nw)
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "Read error: %v\n", rerr)
+			os.Exit(1)
+		}
+	}
+
+	elapsed := time.Since(start)
+	pulledHash := fmt.Sprintf("%x", hasher.Sum(nil))
+
+	if pulledHash != meta.SHA256 {
+		fmt.Fprintf(os.Stderr, "SHA256 mismatch! Expected %s, got %s\n", meta.SHA256, pulledHash)
+		os.Exit(1)
+	}
+
+	mbSec := (float64(totalCopied) / (1024 * 1024)) / elapsed.Seconds()
+	fmt.Printf("Pull completed successfully!\n")
+	fmt.Printf("File: %s\n", *outPath)
+	fmt.Printf("Size: %d bytes (%.2f MB)\n", totalCopied, float64(totalCopied)/(1024*1024))
+	fmt.Printf("SHA-256: %s (VERIFIED MATCH)\n", pulledHash)
+	fmt.Printf("Elapsed: %v (%.2f MB/s)\n", elapsed.Round(time.Millisecond), mbSec)
 }

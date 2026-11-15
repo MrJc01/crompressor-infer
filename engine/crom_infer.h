@@ -51,6 +51,40 @@ typedef struct {
 } crom_q4_mat_t;
 
 typedef struct {
+    const uint8_t  *signs;   /* [rows, (cols / 64) * 8] */
+    const uint16_t *scales;  /* [rows, (cols / 64)] FP16 alpha */
+    int rows;
+    int cols;
+} crom_delta_mat_t;
+
+typedef struct {
+    crom_delta_mat_t q_proj, k_proj, v_proj, o_proj;
+} crom_delta_attn_t;
+
+typedef struct {
+    void *raw_data;
+    size_t raw_size;
+    int fd;
+    uint32_t vocab_base;
+    uint32_t vocab_delta;
+    uint32_t hidden_size;
+    uint32_t intermediate_size;
+    uint32_t num_layers;
+    uint32_t num_experts;
+    uint64_t tok_offset, tok_size;
+    uint64_t embed_offset, embed_size;
+    uint64_t norms_offset, norms_size;
+    uint64_t routers_offset, routers_size;
+    uint64_t attn_offset, attn_size;
+    uint64_t dir_offset;
+    uint32_t dir_count, dir_entry_size;
+    uint64_t exp_offset, exp_size;
+    crom_dir_entry_t *dir;
+    crom_delta_attn_t *attn;
+    const uint8_t *exp_base; /* se mapeado ou pré-carregado */
+} crom_delta_t;
+
+typedef struct {
     crom_q4_mat_t q_proj, k_proj, v_proj, o_proj;
 } crom_attn_t;
 
@@ -146,6 +180,9 @@ typedef struct {
     float *batch_work;
     size_t batch_work_cap;
 
+    /* suporte a Multi-Fine-Tune cromdelta */
+    crom_delta_t *delta;
+
     long long cache_hits;
     long long cache_misses;
     long long ssd_bytes_read;
@@ -193,6 +230,14 @@ crom_c1_mat_t c1_mat_from(const uint8_t *p, int rows, int cols, int k_delta);
 void c1_matvec(const crom_c1_mat_t *W, const float *x, float *out, int threads);
 void c1_matmul_batch(const crom_c1_mat_t *W, const float *X, int B, int stride_X,
                      float *Out, int stride_Out, int threads);
+
+/* Delta API (EXP-014: 1-bit deltas) */
+size_t mat_delta_1bit_bytes(int rows, int cols);
+crom_delta_mat_t delta_mat_from(const uint8_t *p, int rows, int cols);
+void delta_matvec_add(const crom_delta_mat_t *d, const float *x, float *out, int threads);
+void delta_matmul_batch_add(const crom_delta_mat_t *d, const float *X, int B, int stride_X,
+                            float *Out, int stride_Out, int threads);
+int crom_model_apply_delta(crom_model_t *m, const char *delta_path);
 
 /* Getters para Go/C */
 int crom_vocab_size(const crom_model_t *m);

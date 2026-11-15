@@ -1278,6 +1278,82 @@ O modelo híbrido preservou a coerência sintática e o alinhamento com as instr
 
 Hipótese comprovada: **em cenários de streaming SSD com restrição de memória (576 e 384 experts), o formato híbrido supera o Q4 puro em velocidade de decodificação (+19,5% em cache 576 e +13,3% em cache 384)**, pois a economia de ~21,9% na quantidade de bytes transferidos via SSD SATA supera a sobrecarga computacional da desquantização por codebook. O motor C agora é plenamente heterogêneo e pronto para suportar modelos de maior porte.
 
+---
+
+## EXP-014: Multi-Fine-Tune (Base + Delta 1-bit) com Cálculo Direto e Sync de Delta por Rede
+
+**Data:** 14/11/2026  
+**Fase:** 3C  
+**Caminho:** Multi-Fine-Tune / Delta Serving  
+**Status:** concluído com sucesso  
+
+### Objetivo
+
+Implementar e validar na prática o conceito de **Multi-Fine-Tune (`Base + Δ`)** do `crompressor`: servir modelos derivados (ex.: Instruct) calculando diretamente nos deltas sem materializar $W_{\text{derivado}}$ na memória RAM ($y = W_{\text{base}} \cdot x + \Delta \cdot x$), reduzindo o footprint de armazenamento, permitindo download ultra-rápido de modelos derivados via rede em chunks e com verificação criptográfica SHA-256.
+
+### Metodologia e Implementação
+
+1. **Medição Numérica e BitDelta em Python (`tools/test_bitdelta.py`):**
+   - Comparação par a par entre `ibm-granite/granite-3.1-1b-a400m-base` e `ibm-granite/granite-3.1-1b-a400m-instruct`.
+   - Constatações estruturais: tensores de atenção, normas, embeddings e experts possuem os mesmos shapes; o modelo Instruct expande o vocabulário em +3 tokens de controle de chat (49152 → 49155). Os roteadores MoE são 100% idênticos (erro relativo = 0.000000).
+   - Compressão de $\Delta = W_{\text{inst}} - W_{\text{base}}$ em 1 bit por peso com 1 escala FP16 por grupo de 64 (1,25 bits/peso).
+   - Medição de perplexidade (PPL) na fatia de validação da Wikitext-2:
+     - Base puro: PPL = 51.287
+     - Instruct original (BF16): PPL = 56.511
+     - Base + $\Delta_{1\text{-bit}}$: PPL = **61.203** (melhor que os 63.146 do Q4_G64 no EXP-007!).
+   - Tamanho do Delta: **204,0 MB** (vs 829,5 MB do modelo Instruct completo), uma economia de **75,4%**.
+   - Resultados consolidados em `experiments/logs/crom-infer/exp014_bitdelta.json`.
+
+2. **Empacotamento de `.cromdelta` (`tools/pack_cromdelta.py`):**
+   - Criação da ferramenta para gerar `artifacts/granite-1b-instruct.cromdelta` (308,1 MB) contendo:
+     - Header com magic `CROMLD01` (4096 bytes).
+     - `tokenizer.json` do Instruct.
+     - Patch de `embed_tokens` (100,6 MB FP16, 49155 tokens).
+     - Patch de `norms` e `routers` FP32.
+     - Deltas de atenção 1-bit para 24 camadas (11,8 MB).
+     - Diretório e deltas de 768 experts em 1-bit alinhados a 4K (188,7 MB; 245.760 B por expert).
+   - Round-trip check automático: erro L2 de reconstrução dos deltas validado com sucesso.
+
+3. **Motor C com Kernels Delta Diretos (`engine/crom_infer.c` e `engine/crom_infer.h`):**
+   - Criação da API `crom_model_apply_delta(m, delta_path)`.
+   - Implementação de `delta_matvec_add` e `delta_matmul_batch_add` com instruções vetoriais AVX2 (`_mm256_fmadd_ps`, `_mm256_blendv_ps`, desempacotamento de sinais).
+   - Validação analítica contra gabarito numérico: erro L2 relativo = **$2,4098 \times 10^{-7}$** (tolerância $< 10^{-4}$ atendida).
+   - Integração nos loops de atenção e nos experts MoE: aplica as contribuições do delta diretamente aos acumuladores de saída sem alterar os pesos do modelo base.
+
+4. **Transferência de Delta por Rede em Go (`serve-delta` e `pull-delta`):**
+   - Implementação dos comandos na CLI Go (`cmd/crom-infer/main.go`) usando `net/http` e `crypto/sha256`.
+   - `serve-delta`: expõe endpoint `/meta` (tamanho e SHA-256) e `/delta` transmitido em chunks de 1 MiB com flush.
+   - `pull-delta`: baixa em streaming, calcula hash SHA-256 on-the-fly e valida integridade.
+   - Teste de transferência de 308,1 MB: concluído com sucesso e validação de hash perfeita (`f5adac25...`). Economia de largura de banda de 62,8% vs transferir o modelo base + instruct completos.
+
+### Resultados dos Prompts Comparativos
+
+Avaliação de 4 prompts comparando `Base`, `Base + Delta` e `Instruct Q4`:
+
+1. **Prompt 1 ("Explain what a hash table is in simple terms:"):**
+   - Base: *"A hash table is an array of key-value pairs..."*
+   - Base + Delta: *"A hash table is an array of buckets, where each bucket contains one or more items..."* (resposta didática típica de instruct)
+   - Instruct Q4: *"A hash table is like a big box where you can store and retrieve data..."*
+
+2. **Prompt 2 ("Write a Python function to check if a number is prime:"):**
+   - Base: função direta sem docstring elaborada.
+   - Base + Delta: função estruturada com docstring e argumentos formatados (`Check if the given number is prime. Args: n (int)...`).
+   - Instruct Q4: bloco explicativo de instrução com template.
+
+3. **Prompt 3 ("Translate 'The sky is blue' to Portuguese:"):**
+   - Base: continua gerando perguntas sobre vocabulário em inglês.
+   - Base + Delta: `[Translation] "O céu é azul"<|end_of_text|>` (encerra perfeitamente com token EOS do instruct).
+   - Instruct Q4: traduz e gera passos explicativos.
+
+4. **Prompt 4 ("List three colors of the rainbow:"):**
+   - Base: lista repetitiva de pares de cores.
+   - Base + Delta: *"red, orange, and yellow. The first two are primary colors..."*
+   - Instruct Q4: *"red, orange, and yellow. The first color is represented by a single letter..."*
+
+### Conclusão
+
+O paradigma Multi-Fine-Tune com deltas de 1-bit é viável, matematicamente exato e funcional no motor `crom-infer`. Ele permite economizar gigabytes de RAM e disco ao servir dezenas de variantes finetunadas a partir de uma única cópia base, além de viabilizar a atualização de modelos por rede com consumo de banda drasticamente reduzido.
+
 
 
 
