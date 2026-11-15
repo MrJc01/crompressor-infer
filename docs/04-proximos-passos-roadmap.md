@@ -1,126 +1,129 @@
-# Crompressor-Infer — Próximos Passos (Roadmap EXP-011+)
+# Crompressor-Infer — Próximos Passos e Roadmap de Engenharia
 
-> Documento de retomada. Consolida o que já foi **validado até o EXP-010** e os
-> marcos planejados para as próximas sessões. Sempre comparar qualquer novo
-> experimento contra o baseline registrado em `docs/01-ambiente-e-baseline.md`.
-
-## 1. Estado validado até o EXP-010
-
-### Motor e numérica
-
-- **Motor C + AVX2/FMA/F16C** (`engine/crom_infer.c`) operando sobre o formato
-  `.cromllm` alinhado a 4 KiB, com streaming `O_DIRECT`, LRU de experts e
-  KV-cache.
-- **Exatidão vs PyTorch BF16**: checkpoints de camada (`after_emb`,
-  `after_L0_attn_resid`, `after_L0_moe_resid`, `after_L23`), roteamento top-8 e
-  `next_token_id` validados (EXP-008 / EXP-009 / EXP-009B).
-- **`kv_q4` AVX2+FMA** no `q4_matvec` e FMA no `lm_head` (EXP-009B): decode no
-  modo RAM saltou de ~15,5 → **~57 tok/s** com exatidão preservada.
-
-### CLI Go+CGO (EXP-010)
-
-- `bin/crom-infer` (Go 1.22 + CGO) estável em **~59 tok/s** (RAM 768).
-  Os dois bugs da integração foram corrigidos:
-  - **`runtime.LockOSThread()`** — sem ele a goroutine migra entre OS threads e
-    o libgomp reconstrói/contende o time OpenMP a cada `crom_forward` (~100×
-    mais lento, com travamentos).
-  - **`debug.SetGCPercent(-1)`** — evita que workers do GC roubem núcleos do
-    time OpenMP durante a inferência.
-  - Timers `attn_ms` / `moe_ms` / `lm_head_ms` agora vêm de `crom_stats()`.
-
-### Tokenizador nativo (EXP-010)
-
-- `internal/tokenizer/tokenizer.go` reproduz o `GPT2TokenizerFast` do Granite:
-  split de `added_tokens` antes do BPE, tabela byte↔unicode GPT-2,
-  pré-tokenização ByteLevel com lookahead `\s+(?!\S)`, merges por rank e chat
-  template fiel.
-- **100 % `ids_go == ids_hf`** nos 5 casos de `tools/check_tokenizer.py`
-  (prompt cru + 4 prompts com chat template).
-- `eos_token_id` real = `0` (`<|end_of_text|>`).
-
-### Baseline EXP-010 (4 prompts, 6 threads)
-
-| Engine | decode tok/s | prefill tok/s | RSS MB | cache hit % | ssd_stream MB |
-|---|---|---|---|---|---|
-| PyTorch BF16 | 3,81 | — | 3.482 (pico) | — | — |
-| Ollama Q8_0 | 41,32 | 587,82 | ~1.740 | — | — |
-| **crom-infer RAM (768)** | **47,78** | 52,92 | **871** | 100,00 | 0,00 |
-| **crom-infer SSD (576)** | **15,06** | 8,93 | **709** | 90,89 | 2.971,90 |
-
-Tokens do modo SSD (576) **bit-idênticos** ao modo RAM (768) nos 4 prompts.
-
-### Gargalos conhecidos
-
-- **Prefill**: ~53 tok/s contra ~588 tok/s do Ollama — falta processamento em
-  lote (hoje é 1 token por `crom_forward`).
-- **Streaming SSD**: domina o tempo no modo 576 (`moe_ms` ≈ 15,9 s vs 2,3 s no
-  modo RAM); a espera de I/O não é sobreposta ao cálculo.
-- **Contexto**: `CROM_MAX_SEQ = 512` limita o histórico.
+> Documento oficial de consolidação e direcionamento do projeto. Sintetiza o estado validado na prática entre os experimentos **EXP-001 e EXP-015** e detalha com rigor técnico os **5 caminhos futuros** para a continuidade da pesquisa e do desenvolvimento.
 
 ---
 
-## 2. Marco Futuro A — Modelo maior que a RAM (Território Colibrì) — CONCLUÍDO (EXP-015)
+## 1. Estado Atual Consolidado (O que já está validado e funcional)
 
-**Objetivo:** provar que o motor continua útil quando o modelo **não cabe** na
-RAM, que é o diferencial real frente a soluções `mmap`.
+O projeto provou em hardware de consumo real (AMD Ryzen 5 5600GT 6C/12T, 14 GiB RAM, SSD SATA) a viabilidade de inferir modelos MoE sem GPU, com baixa pegada de memória e desacoplamento do carregamento monolítico tradicional:
 
-- [x] **Suporte e Empacotamento de MoE 3.3B (`granite-3.1-3b-a800m-instruct`):**
-  - 32 camadas, 40 experts por camada (1280 experts no total), top-8 ativos, hidden=1536, intermediate=512.
-  - Empacotado em `Q4_G64` (1,84 GiB) e `Híbrido C1_TOPK_K8` (1,58 GiB).
-- [x] **Duelo e Validação contra Ollama (`granite3.1-moe:3b`, Q4_K_M):**
-  - Avaliação de desempenho nos 4 prompts padrão em 100% RAM e 50% RAM (640 experts no cache).
-  - Economia de 22,1% no tráfego de leitura de SSD no modo híbrido vs Q4 (~8,34 GB economizados nos 4 prompts).
-  - Resiliência comprovada sob restrição de memória: o `crom-infer` opera estavelmente sob limites estritos de cgroup/RAM onde processos monolíticos do Ollama sofrem terminação imediata (OOM killer).
+1. **Motor Dinâmico C puro + Go (CGO, AVX2/FMA/F16C, OpenMP):**
+   - Execução em 6 threads físicos sem dependência de PyTorch, CUDA, ROCm ou bibliotecas externas em runtime.
+   - Headers dinâmicos lidos em tempo de execução via `.cromllm` (suporte transparente a variações de `hidden_size`, `intermediate_size`, contagem de camadas, contagem de experts e cabeças de atenção/KV).
+   - Estabilidade CGO garantida por `runtime.LockOSThread()` e `debug.SetGCPercent(-1)`, eliminando contenção do time OpenMP e pausas do garbage collector durante a geração de tokens.
 
----
+2. **Formato `.cromllm` e Subsistema de I/O em Disco:**
+   - Alinhamento uniforme a 4 KiB (páginas de memória física e blocos de disco).
+   - Leitura de pesos via **`O_DIRECT`** contornando a page cache do Linux (`pread()` assíncrono alinhado) para previsibilidade determinística de memória.
+   - Cache LRU de experts em RAM com dimensionamento configurável via flag `--cache-experts`.
+   - **Prefetch Assíncrono (`pthread`, EXP-012):** sobreposição de I/O de disco com computação de camadas MoE, com bloqueio/pinning no eviction do LRU para evitar race conditions.
+   - **Batch Prefill GEMM (`q4_matmul_batch`, EXP-012):** aceleração do processamento inicial de prompt em lote contíguo.
 
-## 3. Marco Futuro B — Streaming SSD mais rápido + Compressão `C1_v2` + Prefill GEMM — CONCLUÍDO (EXP-012, EXP-013)
+3. **Formato Híbrido `C1_TOPK_K8` (`format_id = 2`, EXP-013A, EXP-013B e EXP-015):**
+   - Quantização compacta combinando **Codebook K-Means em cache L1** ($d=4, K=256$, exatamente 4.096 bytes) + **Top-8 Deltas esparsos por grupo de 64** com escala por grupo em FP16 ($[s_{\text{base}}, \alpha]$).
+   - Taxa de compressão de **3,50 bits/peso** nos experts internos e Q4_G64 nas camadas extremas.
+   - Kernels de cálculo direto em C com desempacotamento vetorial AVX2, sem necessidade de desquantizar matrizes completas na memória.
+   - **Resultados empíricos comprovados em 3.3B MoE (EXP-015):** redução de **8,34 GB de tráfego de leitura do SSD SATA (-22,1%)** nos modos sob restrição de cache.
+   - **Resiliência a OOM comprovada sob cgroups (`MemoryMax=900M`):** o `crom-infer` opera continuamente com 640 experts em streaming, enquanto o `llama-server` do Ollama exige 2,29 GB fixos e é sumariamente eliminado pelo kernel (`SIGKILL` / OOM killer).
 
-### B.1 Prefetch assíncrono de experts — [x] CONCLUÍDO (EXP-012)
-- Pipeline I/O ↔ compute com `pthread` e pinning LRU de experts.
-
-### B.2 Suporte a `format_id = 2` (`C1_TOPK_K8`, 3,50 bits/peso) — [x] CONCLUÍDO (EXP-013A / EXP-013B)
-- Codebook `d=4, K=256` normalizado por grupo de 64 + Top-K deltas esparsos com decodificação direta em AVX2.
-
-### B.3 Batch Prefill (GEMM) — [x] CONCLUÍDO (EXP-012)
-- GEMM otimizado com empacotamento contíguo de tokens para prefill de contexto.
-
----
-
-## 4. Marco C — Diferencial `crompressor` (Deltas P2P e Multi-Fine-Tune) — CONCLUÍDO (EXP-014)
-
-### C.1 `W_base + Δ` (múltiplos fine-tunes na mesma RAM) — [x] CONCLUÍDO
-- Suporte a modelo Base (`granite-1b-base.cromllm`) + deltas de 1 bit por grupo de 64 (`granite-1b-instruct.cromdelta`).
-- Cálculo direto no motor C (`delta_matvec_add` AVX2 unrolled com FMA) sem materializar $W_{\text{instruct}}$.
-- Economia de 75,4% no armazenamento de deltas com qualidade de PPL (61.20) superior a Q4.
-
-### C.2 Distribuição/sincronização de deltas via Rede — [x] CONCLUÍDO
-- Subcomandos `serve-delta` e `pull-delta` em Go nativo (`net/http` + `crypto/sha256`) com streaming por chunks de 1 MiB e validação criptográfica ponta a ponta.
+4. **Multi-Fine-Tune em CPU com `.cromdelta` 1-bit (EXP-014):**
+   - Conceito exclusivo de servir variantes finetunadas aplicando deltas esparsos de 1-bit diretamente no acumulador FP32: $y = W_{\text{base}} \cdot x + \Delta_{\text{1-bit}} \cdot x$.
+   - Redução do delta Instruct para **204,0 MB** (vs 829,5 MB do modelo completo, economia de 75,4%) com perplexidade preservada (PPL 61.20 vs 63.14 do Q4 puro).
+   - Formato binário `.cromdelta` (293,8 MB com tokenizador e embeddings) transmitido e sincronizado via rede local por subcomandos Go nativos (`serve-delta` e `pull-delta`) com streaming em blocos de 1 MiB e validação ponta a ponta por hash SHA-256.
 
 ---
 
-## 5. Higiene e Empacotamento
+## 2. Caminhos Futuros de Engenharia
 
-- [x] **Aumentar `CROM_MAX_SEQ`** e tornar contexto dinâmico no cabeçalho / flag `--ctx 2048` (**concluído no EXP-011**).
-- [x] **Adicionar flag `--repeat-penalty`** na amostragem (**concluído no EXP-011**).
-- [x] **Motor C e Go 100% dinâmico** por header `.cromllm` sem hardcoding de dimensões (**concluído no EXP-011**).
-- [x] **Batch Prefill GEMM e Prefetch Assíncrono via pthread** (**concluído no EXP-012**).
-- [x] **Layout Compacto C1_TOPK, format_id = 2 e Perfil Híbrido** (**concluído no EXP-013A**).
-- [x] **Kernel C C1_TOPK direto e Duelo Híbrido vs Q4 em SSD Streaming** (**concluído no EXP-013B**).
-- [x] **Multi-Fine-Tune Base + Delta 1-bit e Sync de Deltas por Rede** (**concluído no EXP-014**).
-- [x] **MoE de 3.3B (Granite-3.1-3B) em Q4 e Híbrido C1_K8 vs Ollama** (**concluído no EXP-015**).
-- [ ] Suporte a modelos com MoE de 64+ experts (`OLMoE-1B-7B`) sob orçamentos ultra-restritos (< 1 GB de RAM).
-- [ ] Suportar **múltiplos modelos** no cabeçalho `.cromllm` (catálogo/versão).
-- [x] Manter `crompressor/`, `artifacts/`, `bin/`, `*.a`, `*.o` fora do versionamento.
+Com os fundamentos matemáticos e a infraestrutura de I/O validados, os próximos passos do projeto estruturam-se em 5 avenidas complementares de pesquisa e implementação:
+
+```
+                               ┌────────────────────────────────────────────────────────┐
+                               │            Crompressor-Infer (Motor Base)             │
+                               │        Go 1.22 + C / AVX2 / O_DIRECT / LRU 4K          │
+                               └──────────────────────────┬─────────────────────────────┘
+                                                          │
+          ┌───────────────────────┬───────────────────────┼───────────────────────┬───────────────────────┐
+          │                       │                       │                       │                       │
+          ▼                       ▼                       ▼                       ▼                       ▼
+    [CAMINHO 1]             [CAMINHO 2]             [CAMINHO 3]             [CAMINHO 4]             [CAMINHO 5]
+  Modelos > RAM           Calibração AWQ/         Especulação SSD         GEMM Prefill            Ponte Ecossistema
+  (Colibrì: > 14 GiB)     imatrix (< 3 bits)      (Draft RAM + Verify)    (BLAS Otimizado)        (Plugin CROM P2P)
+  Qwen-30B / OLMoE        Proteger Salientes      1B draft -> 30B SSD     Fechar gap com          Injeção em llama.cpp
+  Teto cabo SATA          Meta: 2,0–2,5 bpw       2x a 3x tok/s SSD       Ollama (250+ t/s)       ou Colibrì C
+```
 
 ---
 
-## 6. Ordem sugerida de retomada
+### Caminho 1: O Desafio dos Modelos Maiores que a RAM Física (> 14 GiB — Território Colibrì)
 
-1. **EXP-011** (Motor Dinâmico + `--ctx 2048` + `--repeat-penalty`) — **CONCLUÍDO**.
-2. **EXP-012** (Batch Prefill GEMM + Prefetch Assíncrono SSD via `pthread` + pinning LRU) — **CONCLUÍDO**.
-3. **EXP-013A / EXP-013B** (`C1_TOPK_K8` híbrido: 3,75 bits/peso, +19,5% tok/s em SSD 576) — **CONCLUÍDO**.
-4. **EXP-014** (Multi-Fine-Tune Base+Delta 1-bit + Sync de Delta via Rede HTTP) — **CONCLUÍDO**.
-5. **EXP-015** (Granite-3.1-3B MoE em Q4 e Híbrido C1_K8 vs Ollama sob pressão de RAM) — **CONCLUÍDO**.
-6. **EXP-016** (Escala para MoE 7B com 64 experts — OLMoE-1B-7B — ou compressão C1_TOPK_K4 a 3.0 bits/peso).
+**Objetivo Central:** Demonstrar o valor do projeto no cenário onde o modelo **não pode ser mantido na memória física**, forçando soluções convencionais de `mmap` a sofrer *page thrashing* catastrófico.
 
+- **Alvos Arquiteturais:**
+  - `Qwen/Qwen3-30B-A3B` (30,5 bilhões de parâmetros totais, 128 experts, ~3,3B ativos por token, ~17 GB em Q4).
+  - `allenai/OLMoE-1B-7B-0924` (7 bilhões de parâmetros totais, 64 experts, ~1,3B ativos, ~4,5 GB em Q4).
+- **Desafios e Requisitos de Engenharia:**
+  - **Suporte a Novas Primitivas:** adaptar `crom_infer.c` para suportar arquiteturas MoE com projeções separadas `gate_proj`, `up_proj` e `down_proj` (SwiGLU padrão), além de normalização de chaves e consultas (`qk_norm`).
+  - **Vocabulários Extensos:** gerenciar matrizes de embedding e LM-head de 152k tokens (`Qwen`) com paginação sob demanda ou decomposição linear em disco para não inflar a porção Hot residente.
+  - **Caracterização do Teto de Hardware:** medir a velocidade limite imposta pela largura de banda contínua do SSD SATA (~450–500 MB/s práticos) em face do número de experts roteados por token ($k \times L$).
+  - **Métrica de Sucesso:** alcançar geração estável e sem vazamentos de memória em modelos de 30B rodando com apenas 4 a 6 GiB de RAM alocados ao cache de experts.
+
+---
+
+### Caminho 2: Calibração de Ativações e Hessiana (AWQ / imatrix) para Compressão < 3 bits
+
+**Diagnóstico Atual:** No EXP-006 e no EXP-013A, tentar reduzir a quantização direta para `C1_TOPK_K4` (~3,0 bits/peso) sem calibração prévia provocou degradação sensível da perplexidade (PPL subiu para ~85 no perfil híbrido). A seleção ingênua de centróides por K-Means trata todos os parâmetros com o mesmo peso estatístico, penalizando pesos salientes (*outliers*) críticos para a estabilidade dos estados ocultos.
+
+- **Solução Planejada:**
+  - **Coleta de Estatísticas de Ativação:** executar um conjunto padrão de calibração (ex: 512 sequências da Wikitext-2 / C4) em FP16/BF16 para acumular a matriz de covariância das ativações ou o módulo médio das entradas $s_x = \mathbb{E}[|x|]$.
+  - **Ponderação por Importância (Salience Weighting):** minimizar a função de perda ponderada durante o treino do Codebook:
+    $$\mathcal{L} = \| (W - \hat{W}) \cdot \text{diag}(s_x) \|_F^2$$
+  - **Isolamento de Outliers Críticos:** canalizar os $K$ pesos com maior erro quadrático ponderado para a lista de deltas esparsos de alta precisão (FP16 ou 2-bit residual), mantendo os centróides do codebook restritos à distribuição densa de menor variância.
+- **Métrica de Sucesso:** atingir **2,0 a 2,5 bits por peso** nos experts intermediários com degradação de PPL inferior a 5% em relação ao BF16, cortando o volume de leitura do disco por token em **40% a 50%**.
+
+---
+
+### Caminho 3: Decodificação Especulativa no SSD (Draft Model em RAM + Verificação no Disco)
+
+**Fundamento Físico:** Como medido empiricamente no EXP-012, ler um bloco de expert de 884 KiB do SSD SATA consome praticamente o mesmo tempo (~2,2 a 2,6 ms de latência de leitura e busca no barramento) quer ele processe 1 token individual ou um lote contíguo de 4 a 6 tokens no GEMM. A decodificação sequencial autoregressiva é severamente limitada pela latência de I/O por passo.
+
+- **Arquitetura Proposta:**
+  - **Draft Model Residente (em RAM):** o modelo leve `granite-3.1-1b-a400m` reside integralmente em memória (871 MB RSS), decodificando de forma autônoma a **~50 tok/s** para gerar uma sequência proposta de $K$ tokens especulativos: $(\hat{t}_1, \hat{t}_2, \dots, \hat{t}_K)$.
+  - **Target Model em Streaming (no SSD):** o modelo principal de 3.3B (ou 30B) recebe o lote de $K$ tokens em um único passo de prefill/verificação em lote (`crom_forward_batch`).
+  - **Amortização de I/O:** os experts necessários para os $K$ tokens são lidos uma única vez do disco e computados conjuntamente via GEMM vetorial.
+- **Métrica de Sucesso:** multiplicar o throughput do modo streaming de SSD em **2x a 3x** (elevando de ~3,2 tok/s para **7,0–10,0+ tok/s** em 50% de RAM).
+
+---
+
+### Caminho 4: Aceleração do Prefill com Kernels GEMM Otimizados (Fechar o Gap com o Ollama)
+
+**Diagnóstico Atual:** O prefill do `crom-infer` evoluiu expressivamente no EXP-012 (saltando de 52 para ~90 tok/s no 1B e atingindo ~41 tok/s no 3B). No entanto, o Ollama/llama.cpp atinge de 250 a 580 tok/s porque utiliza rotinas BLAS altamente vetorizadas em blocos de registradores que maximizam a taxa de ocupação dos pipelines FMA da CPU.
+
+- **Soluções em Engenharia de Baixo Nível:**
+  - **Micro-kernel GEMM com Register Blocking $6 \times 16$:** reescrever o laço interno de `q4_matmul_batch` utilizando um esquema de empacotamento em ladrilhos (*tiling*) que mantenha 12 a 14 acumuladores YMM ativos simultaneamente, reduzindo o tráfego com o cache L1 de dados.
+  - **Integração de Backend BLAS Leve (Header-only):** avaliar a inclusão de bibliotecas de álgebra linear sem dependências runtime pesadas (ex: kernels INT8/FP16 inspirados em `gemmlowp` ou `tinyBLAS`) dedicadas à projeção de atenção e aos roteadores MoE durante o prompt eval.
+- **Métrica de Sucesso:** atingir **150+ tok/s de prefill no 3B** e **300+ tok/s no 1B** em CPU com 6 threads, eliminando a discrepância no tempo de ingestão do prompt.
+
+---
+
+### Caminho 5: Ponte de Ecossistema e P2P CROM
+
+**Fundamento Estratégico:** A maturidade do projeto permitiu validar componentes pioneiros — em particular o formato `.cromdelta` de 1-bit e a sincronização distribuída por blocos criptográficos com hash SHA-256. Em vez de reescrever dezenas de variantes de transformadores e kernels manuais de CPU do zero, podemos desacoplar essas inovações e oferecê-las ao ecossistema existente.
+
+- **Iniciativas Planejadas:**
+  - **Biblioteca CROM-Delta Integrável:** exportar a lógica de `delta_matvec_add` e do cabeçalho `.cromdelta` como uma biblioteca C pura e autocontida (`libcromdelta.a` / `libcromdelta.h`), capaz de ser embutida diretamente como backend de pesos adicionais no `llama.cpp` ou no `Colibrì`.
+  - **Daemon P2P em Go:** evoluir os comandos `serve-delta` e `pull-delta` para um protocolo de fofoca (*gossip protocol*) ou distribuição descentralizada baseada em DHT (Distributed Hash Table), permitindo que nós locais compartilhem deltas de especialistas instantaneamente conforme novas tarefas de fine-tuning sejam disponibilizadas.
+- **Métrica de Sucesso:** carregar e rodar um delta `.cromdelta` gerado pelo nosso pipeline dentro de um runtime externo como o `llama.cpp` sem conversão offline de pesos.
+
+---
+
+## 3. Matriz Comparativa e Ordem de Execução
+
+| Caminho | Complexidade | Retorno Esperado | Pré-requisitos | Prioridade |
+|---|---|---|---|---|
+| **Caminho 1 (Modelos > RAM)** | Alta | Validação definitiva contra mmap em hardware extremo | Parser para SwiGLU / gate-up separados | **1** |
+| **Caminho 3 (Especulação SSD)** | Média-Alta | Multiplicação de 2x a 3x no decode de SSD | Batch Prefill funcional (EXP-012) | **2** |
+| **Caminho 2 (Calibração < 3 bits)** | Alta | Redução de 40-50% de I/O em disco com PPL alta | Pipeline Python com PyTorch/imatrix | **3** |
+| **Caminho 4 (Aceleração Prefill)** | Média | Fechar gap de ingestão vs Ollama | Micro-kernels AVX2 register blocking | **4** |
+| **Caminho 5 (Ponte Ecossistema)** | Baixa-Média | Adoção e interoperabilidade externa | Estabilização final do formato .cromdelta | **5** |
