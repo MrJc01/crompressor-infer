@@ -46,6 +46,10 @@ comparar contra uma linha desta tabela.
 | 1 | granite3.1-moe:1b | (interna Ollama, ~1,4 GB em disco) | 39,5–45,0 (média ~41,3) | 501–695 | ~1,6 GiB RSS (`llama-server`) + 34 MB (`ollama serve`) | 1,4 GB | 4 prompts fixos (EXP-002) | `experiments/logs/baseline-ollama/baseline_results.json` |
 | 2 | **crom-infer Q4_g64 (RAM 768)** | Q4_g64 (idx u8 + scales f32, grupo 64), experts residentes | **47,8** (média 4 prompts) | **52,9** | **871 MB RSS** | **791 MiB** (`artifacts/granite-1b.cromllm`) | 4 prompts fixos (EXP-010) | `experiments/logs/crom-infer/duelo_ollama.json` |
 | 3 | **crom-infer Q4_g64 (SSD 576)** | Q4_g64 + streaming `O_DIRECT` (75% RAM, LRU) | **15,1** (média 4 prompts) | **8,9** | **709 MB RSS** (cache_hit **90,9%**, `ssd_stream` **2971,9 MB**) | **791 MiB** (`artifacts/granite-1b.cromllm`) | 4 prompts fixos (EXP-010) | `experiments/logs/crom-infer/duelo_ollama.json` |
+| 4 | **granite3.1-moe:3b** (Ollama) | Q4_K_M (interna Ollama, ~2,0 GB em disco) | **33,33** (média 4 prompts) | **254,87** | **2.272,8 MB RSS** (`llama-server`) | **2,0 GB** | 4 prompts fixos (EXP-015) | `experiments/logs/crom-infer/exp015_granite3b_duel.json` |
+| 5 | **crom-infer 3B Q4 (RAM 1280)** | Q4_G64 (3.3B MoE, 1280 experts residentes) | **22,78** (média 4 prompts) | **41,52** | **2.188,0 MB RSS** | **1.883,2 MiB** (`artifacts/granite-3b-q4.cromllm`) | 4 prompts fixos (EXP-015) | `experiments/logs/crom-infer/exp015_granite3b_duel.json` |
+| 6 | **crom-infer 3B Híbrido (RAM 1280)** | Híbrido Q4 + C1_TOPK_K8 (3.50 bpw) | **13,14** (média 4 prompts) | **17,30** | **1.925,5 MB RSS** | **1.620,8 MiB** (`artifacts/granite-3b-hybrid.cromllm`) | 4 prompts fixos (EXP-015) | `experiments/logs/crom-infer/exp015_granite3b_duel.json` |
+| 7 | **crom-infer 3B Híbrido (SSD 640)** | Híbrido C1_K8 + Streaming SSD 50% RAM | **3,18** (média 4 prompts) | **8,44** | **1.369,5 MB RSS** (economia I/O **-22,1%** vs Q4) | **1.620,8 MiB** (`artifacts/granite-3b-hybrid.cromllm`) | 4 prompts fixos (EXP-015) | `experiments/logs/crom-infer/exp015_granite3b_duel.json` |
 
 ### Protocolo sugerido do baseline
 

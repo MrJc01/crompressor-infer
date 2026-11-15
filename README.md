@@ -88,8 +88,11 @@ python3 tools/duelo_ollama.py
 
 ## Estado atual
 
-Validado até o **EXP-010**: motor C+AVX2/FMA com `O_DIRECT` e LRU, CLI Go+CGO
-estável (~59 tok/s no modo RAM), tokenizador BPE nativo 100 % fiel ao
-HuggingFace e duelo oficial contra Ollama/PyTorch. Próximos marcos (modelo maior
-que a RAM, prefetch assíncrono, `C1_v2` a 3,10 bits, prefill em lote, deltas
-P2P) estão descritos em `docs/04`.
+Validado até o **EXP-015**:
+- **Suporte a MoE 3.3B (Granite-3.1-3B MoE):** 32 camadas, 40 experts por camada (1280 experts no total), top-8 ativos.
+- **Quantização Híbrida (`C1_TOPK_K8` + Q4):** Redução de 22% no tráfego de SSD streaming em 50% de RAM vs Q4 puro.
+- **Resiliência sob restrição de RAM:** Operação estável sob limitação de memória via cgroups/systemd onde modelos monolíticos sofrem terminação forçada por OOM.
+- **Multi-Fine-Tune (`Base + Δ` 1-bit, EXP-014):** Compartilhamento de base MoE com transferência de deltas por rede.
+- **Batch Prefill GEMM & Prefetch Assíncrono (`pthread`, EXP-012):** Aceleração de contexto e amortização de latência de leitura de SSD.
+- Próximos passos e backlog descritos em `docs/04-proximos-passos-roadmap.md`.
+

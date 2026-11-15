@@ -192,20 +192,25 @@ def pack(model_id=MODEL_ID, out_path=OUT, profile="q4"):
     torch.set_num_threads(6)
     print(f"Carregando modelo {model_id} (perfil: {profile})...")
     model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16,
-                                                 low_cpu_mem_usage=True,
-                                                 local_files_only=True)
+                                                 low_cpu_mem_usage=True)
     model.eval()
     cfg = model.config
     L, E, H = cfg.num_hidden_layers, cfg.num_local_experts, cfg.hidden_size
     params = dict(model.named_parameters())
 
-    tok_path = os.path.dirname(cached_file(model_id, "config.json", local_files_only=True))
+    tok_path = os.path.dirname(cached_file(model_id, "config.json"))
     tok_bytes = open(os.path.join(tok_path, "tokenizer.json"), "rb").read()
     print(f"tokenizer.json embutido: {len(tok_bytes):,} bytes")
 
-    qsz = mat_q4_bytes(H, H)          # q/o [1024,1024] = 589824
-    ksz = mat_q4_bytes(cfg.num_key_value_heads * (H // cfg.num_attention_heads), H)  # k/v [512,1024]
+    qsz = mat_q4_bytes(H, H)
+    ksz = mat_q4_bytes(cfg.num_key_value_heads * (H // cfg.num_attention_heads), H)
     per_layer_attn = qsz + 2 * ksz + qsz
+
+    # Configuração dinâmica de camadas extremas: 4 primeiras e 4 últimas camadas em Q4
+    extremas = set(range(min(4, L))) | set(range(max(0, L - 4), L))
+    mid_layer = L // 2
+    I = cfg.intermediate_size
+    in_exp_dim = 2 * I
 
     # Configuração do perfil por camada
     def get_layer_format(li):
@@ -216,9 +221,9 @@ def pack(model_id=MODEL_ID, out_path=OUT, profile="q4"):
         elif profile == "c1-topk4":
             return C1_K4, 4
         elif profile in ("hybrid-c1-k8", "hibrido-c1-k8"):
-            return (Q4, 0) if li in EXTREMAS else (C1_K8, 8)
+            return (Q4, 0) if li in extremas else (C1_K8, 8)
         elif profile in ("hybrid-c1-k4", "hibrido-c1-k4"):
-            return (Q4, 0) if li in EXTREMAS else (C1_K4, 4)
+            return (Q4, 0) if li in extremas else (C1_K4, 4)
         else:
             raise ValueError(f"Perfil desconhecido: {profile}")
 
@@ -265,12 +270,21 @@ def pack(model_id=MODEL_ID, out_path=OUT, profile="q4"):
         emb = params["model.embed_tokens.weight"].data.to(torch.float16).contiguous()
         pos = section(f, pos, emb.numpy().tobytes())
         del emb
-        for i in range(L):                       # norms: L0.in, L0.post, ..., final
-            pos = section(f, pos, params[f"model.layers.{i}.input_layernorm.weight"].data.float().numpy().tobytes())
-            pos = section(f, pos, params[f"model.layers.{i}.post_attention_layernorm.weight"].data.float().numpy().tobytes())
-        pos = section(f, pos, params["model.norm.weight"].data.float().numpy().tobytes())
-        for i in range(L):                       # routers FP32
-            pos = section(f, pos, params[f"model.layers.{i}.block_sparse_moe.router.layer.weight"].data.float().numpy().tobytes())
+        norms_bytes = b"".join(
+            params[f"model.layers.{i}.input_layernorm.weight"].data.float().numpy().tobytes() +
+            params[f"model.layers.{i}.post_attention_layernorm.weight"].data.float().numpy().tobytes()
+            for i in range(L)
+        ) + params["model.norm.weight"].data.float().numpy().tobytes()
+        pos = section(f, pos, norms_bytes)
+        del norms_bytes
+
+        routers_bytes = b"".join(
+            params[f"model.layers.{i}.block_sparse_moe.router.layer.weight"].data.float().numpy().tobytes()
+            for i in range(L)
+        )
+        pos = section(f, pos, routers_bytes)
+        del routers_bytes
+
         inv = model.model.rotary_emb.inv_freq.float().numpy()
         pos = section(f, pos, inv.tobytes())
         attn_off0 = pos
@@ -350,53 +364,62 @@ def pack(model_id=MODEL_ID, out_path=OUT, profile="q4"):
         blob0 = f.read(e0_sz)
     ref_in0 = model.model.layers[0].block_sparse_moe.input_linear.weight.data[0].float()
     ref_out0 = model.model.layers[0].block_sparse_moe.output_linear.weight.data[0].float()
+    rows_in = ref_in0.shape[0]  # in_exp_dim = 2 * intermediate_size
+    cols_in = ref_in0.shape[1]  # H
+    rows_out = ref_out0.shape[0] # H
+    cols_out = ref_out0.shape[1] # intermediate_size
+
     if e0_fmt == Q4:
-        nidx = H * (H // 2)
-        idx1 = torch.frombuffer(bytearray(blob0[:nidx]), dtype=torch.uint8).view(H, H // 2).numpy()
-        sc1 = torch.frombuffer(bytearray(blob0[nidx:nidx + H * (H // G) * 4]), dtype=torch.float32).view(H, H // G).numpy()
+        nidx1 = rows_in * (cols_in // 2)
+        sz_in = mat_q4_bytes(rows_in, cols_in)
+        idx1 = torch.frombuffer(bytearray(blob0[:nidx1]), dtype=torch.uint8).view(rows_in, cols_in // 2).numpy()
+        sc1 = torch.frombuffer(bytearray(blob0[nidx1:sz_in]), dtype=torch.float32).view(rows_in, cols_in // G).numpy()
         deq_in0 = q4_dequant(idx1, sc1)
-        off2 = mat_q4_bytes(H, H)
-        nidx2 = H * (cfg.intermediate_size // 2)
-        idx2 = torch.frombuffer(bytearray(blob0[off2:off2 + nidx2]), dtype=torch.uint8).view(H, cfg.intermediate_size // 2).numpy()
-        sc2 = torch.frombuffer(bytearray(blob0[off2 + nidx2:]), dtype=torch.float32).view(H, cfg.intermediate_size // G).numpy()
+
+        blob_out = blob0[sz_in:]
+        nidx2 = rows_out * (cols_out // 2)
+        idx2 = torch.frombuffer(bytearray(blob_out[:nidx2]), dtype=torch.uint8).view(rows_out, cols_out // 2).numpy()
+        sc2 = torch.frombuffer(bytearray(blob_out[nidx2:]), dtype=torch.float32).view(rows_out, cols_out // G).numpy()
         deq_out0 = q4_dequant(idx2, sc2)
     else:
         k_d = 8 if e0_fmt == C1_K8 else 4
-        in_bytes = mat_c1_bytes(H, H, k_d)
-        deq_in0 = c1_topk_dequant(blob0[:in_bytes], H, H, k_d)
-        deq_out0 = c1_topk_dequant(blob0[in_bytes:], H, cfg.intermediate_size, k_d)
+        in_bytes = mat_c1_bytes(rows_in, cols_in, k_d)
+        deq_in0 = c1_topk_dequant(blob0[:in_bytes], rows_in, cols_in, k_d)
+        deq_out0 = c1_topk_dequant(blob0[in_bytes:], rows_out, cols_out, k_d)
     err_in0 = ((deq_in0 - ref_in0) ** 2).sum().sqrt() / ref_in0.norm()
     err_out0 = ((deq_out0 - ref_out0) ** 2).sum().sqrt() / ref_out0.norm()
     print(f"round-trip expert L0/E0 in  (fmt={e0_fmt}) : {tuple(ref_in0.shape)} -> erro L2 rel = {err_in0:.4f}")
     print(f"round-trip expert L0/E0 out (fmt={e0_fmt}) : {tuple(ref_out0.shape)} -> erro L2 rel = {err_out0:.4f}")
 
-    # Valida expert L11/E0 (camada central)
-    idx_l11 = 11 * E + 0
-    e11_off, e11_sz, e11_fmt, _ = entries[idx_l11]
+    # Valida expert L(mid)/E0 (camada central)
+    idx_mid = mid_layer * E + 0
+    emid_off, emid_sz, emid_fmt, _ = entries[idx_mid]
     with open(out_path, "rb") as f:
-        f.seek(e11_off)
-        blob11 = f.read(e11_sz)
-    ref_in11 = model.model.layers[11].block_sparse_moe.input_linear.weight.data[0].float()
-    ref_out11 = model.model.layers[11].block_sparse_moe.output_linear.weight.data[0].float()
-    if e11_fmt == Q4:
-        nidx = H * (H // 2)
-        idx1 = torch.frombuffer(bytearray(blob11[:nidx]), dtype=torch.uint8).view(H, H // 2).numpy()
-        sc1 = torch.frombuffer(bytearray(blob11[nidx:nidx + H * (H // G) * 4]), dtype=torch.float32).view(H, H // G).numpy()
-        deq_in11 = q4_dequant(idx1, sc1)
-        off2 = mat_q4_bytes(H, H)
-        nidx2 = H * (cfg.intermediate_size // 2)
-        idx2 = torch.frombuffer(bytearray(blob11[off2:off2 + nidx2]), dtype=torch.uint8).view(H, cfg.intermediate_size // 2).numpy()
-        sc2 = torch.frombuffer(bytearray(blob11[off2 + nidx2:]), dtype=torch.float32).view(H, cfg.intermediate_size // G).numpy()
-        deq_out11 = q4_dequant(idx2, sc2)
+        f.seek(emid_off)
+        blob_mid = f.read(emid_sz)
+    ref_in_mid = model.model.layers[mid_layer].block_sparse_moe.input_linear.weight.data[0].float()
+    ref_out_mid = model.model.layers[mid_layer].block_sparse_moe.output_linear.weight.data[0].float()
+    if emid_fmt == Q4:
+        nidx1 = rows_in * (cols_in // 2)
+        sz_in = mat_q4_bytes(rows_in, cols_in)
+        idx1 = torch.frombuffer(bytearray(blob_mid[:nidx1]), dtype=torch.uint8).view(rows_in, cols_in // 2).numpy()
+        sc1 = torch.frombuffer(bytearray(blob_mid[nidx1:sz_in]), dtype=torch.float32).view(rows_in, cols_in // G).numpy()
+        deq_in_mid = q4_dequant(idx1, sc1)
+
+        blob_out = blob_mid[sz_in:]
+        nidx2 = rows_out * (cols_out // 2)
+        idx2 = torch.frombuffer(bytearray(blob_out[:nidx2]), dtype=torch.uint8).view(rows_out, cols_out // 2).numpy()
+        sc2 = torch.frombuffer(bytearray(blob_out[nidx2:]), dtype=torch.float32).view(rows_out, cols_out // G).numpy()
+        deq_out_mid = q4_dequant(idx2, sc2)
     else:
-        k_d = 8 if e11_fmt == C1_K8 else 4
-        in_bytes = mat_c1_bytes(H, H, k_d)
-        deq_in11 = c1_topk_dequant(blob11[:in_bytes], H, H, k_d)
-        deq_out11 = c1_topk_dequant(blob11[in_bytes:], H, cfg.intermediate_size, k_d)
-    err_in11 = ((deq_in11 - ref_in11) ** 2).sum().sqrt() / ref_in11.norm()
-    err_out11 = ((deq_out11 - ref_out11) ** 2).sum().sqrt() / ref_out11.norm()
-    print(f"round-trip expert L11/E0 in  (fmt={e11_fmt}) : {tuple(ref_in11.shape)} -> erro L2 rel = {err_in11:.4f}")
-    print(f"round-trip expert L11/E0 out (fmt={e11_fmt}) : {tuple(ref_out11.shape)} -> erro L2 rel = {err_out11:.4f}")
+        k_d = 8 if emid_fmt == C1_K8 else 4
+        in_bytes = mat_c1_bytes(rows_in, cols_in, k_d)
+        deq_in_mid = c1_topk_dequant(blob_mid[:in_bytes], rows_in, cols_in, k_d)
+        deq_out_mid = c1_topk_dequant(blob_mid[in_bytes:], rows_out, cols_out, k_d)
+    err_in_mid = ((deq_in_mid - ref_in_mid) ** 2).sum().sqrt() / ref_in_mid.norm()
+    err_out_mid = ((deq_out_mid - ref_out_mid) ** 2).sum().sqrt() / ref_out_mid.norm()
+    print(f"round-trip expert L{mid_layer}/E0 in  (fmt={emid_fmt}) : {tuple(ref_in_mid.shape)} -> erro L2 rel = {err_in_mid:.4f}")
+    print(f"round-trip expert L{mid_layer}/E0 out (fmt={emid_fmt}) : {tuple(ref_out_mid.shape)} -> erro L2 rel = {err_out_mid:.4f}")
     print("round-trip: 'OK'")
 
 
@@ -412,10 +435,9 @@ def _norm6(t):
 
 def golden(model_id=MODEL_ID):
     torch.set_num_threads(6)
-    tok = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+    tok = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16,
-                                                 low_cpu_mem_usage=True,
-                                                 local_files_only=True)
+                                                 low_cpu_mem_usage=True)
     model.eval()
     enc = tok(GOLDEN_TEXT, return_tensors="pt")
     ids = enc.input_ids[0].tolist()
@@ -449,12 +471,15 @@ def golden(model_id=MODEL_ID):
     # after_L0_moe_resid: saida completa da camada 0 (apos MoE + residuo)
     hooks.append(model.model.layers[0].register_forward_hook(save_post("l0_out")))
 
-    # after_L23: saida da camada 23, ANTES da final_norm
-    hooks.append(model.model.layers[23].register_forward_hook(save_post("l23_out")))
+    L = model.config.num_hidden_layers
+    last_layer = L - 1
 
-    # roteamento (mantido do EXP-007), com hooks removidos ao fim
+    # after_L_last: saida da ultima camada, ANTES da final_norm
+    hooks.append(model.model.layers[last_layer].register_forward_hook(save_post("last_layer_out")))
+
+    # roteamento, com hooks removidos ao fim
     routing = {}
-    for li in (0, 23):
+    for li in (0, last_layer):
         router = model.model.layers[li].block_sparse_moe.router.layer
         def hook(_m, _inp, out, li=li):
             routing[li] = out.detach()
@@ -479,8 +504,8 @@ def golden(model_id=MODEL_ID):
         print(f"  {t['id']:6d} {t['logit']:8.4f}  {t['token']!r}")
 
     rot = {}
-    for li in (0, 23):
-        rl = routing[li].float()[-1]            # ultimo token: [32]
+    for li in (0, last_layer):
+        rl = routing[li].float()[-1]            # ultimo token
         tvals, tids8 = rl.topk(8)
         w = torch.softmax(tvals, dim=0)
         rot[li] = {"expert_ids": tids8.tolist(),
@@ -498,7 +523,7 @@ def golden(model_id=MODEL_ID):
         "after_emb": _norm6(ckpt["after_emb"]),
         "after_L0_attn_resid": _norm6(after_L0_attn_resid),
         "after_L0_moe_resid": _norm6(ckpt["l0_out"]),
-        "after_L23": _norm6(ckpt["l23_out"]),
+        f"after_L{last_layer}": _norm6(ckpt["last_layer_out"]),
     }
     print("checkpoints (ultimo token, fp32):")
     for k, v in checkpoints.items():
@@ -507,23 +532,26 @@ def golden(model_id=MODEL_ID):
         else:
             print(f"  {k}: l2={v['l2']:.6f} first6={v['first6']}")
 
+    golden_file = "artifacts/golden_ref_3b.json" if "3b" in model_id else GOLDEN
+    golden_meta_file = "artifacts/golden_ref_meta_3b.json" if "3b" in model_id else GOLDEN_META
+
     ref = {"model_id": model_id, "text": GOLDEN_TEXT, "input_ids": ids,
            "routing": {str(k): v for k, v in rot.items()},
            "top10_logits": top10, "next_token": {"id": nxt, "token": nxt_txt},
            "checkpoints": checkpoints}
     os.makedirs("artifacts", exist_ok=True)
-    with open(GOLDEN, "w", encoding="utf-8") as f:
+    with open(golden_file, "w", encoding="utf-8") as f:
         json.dump(ref, f, ensure_ascii=False, indent=2)
     meta = {"model_id": model_id, "text": GOLDEN_TEXT, "n_input_ids": len(ids),
             "input_ids": ids,
-            "routing_l0": rot[0], "routing_l23": rot[23],
+            "routing_l0": rot[0], f"routing_l{last_layer}": rot[last_layer],
             "top10_ids": [t["id"] for t in top10],
             "top10_logits": [round(t["logit"], 4) for t in top10],
             "next_token": {"id": nxt, "token": nxt_txt},
             "checkpoints": checkpoints}
-    with open(GOLDEN_META, "w", encoding="utf-8") as f:
+    with open(golden_meta_file, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
-    print(f"salvo: {GOLDEN} + {GOLDEN_META}")
+    print(f"salvo: {golden_file} + {golden_meta_file}")
 
 
 if __name__ == "__main__":
